@@ -5,40 +5,40 @@ import { pipeline } from "node:stream/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STATUS_ID = "pi-talk";
-const MAX_CHUNK_LENGTH = 360;
 const OPENAI_SPEECH_URL = "https://api.openai.com/v1/audio/speech";
 
 type UiLevel = "info" | "warning" | "error";
+type SpeechMode = "gagged" | "talking" | "paused";
 
 type SpeechState = {
-  enabled: boolean;
-  paused: boolean;
+  mode: SpeechMode;
   processing: boolean;
   queue: string[];
   currentController?: AbortController;
   currentPlayer?: ChildProcessWithoutNullStreams;
   generation: number;
   activeContext?: ExtensionContext;
-  markdownCarry: string;
-  proseBuffer: string;
-  insideFence: boolean;
+  messageMarkdown: string;
   currentUtterances: string[];
-  lastUtterances: string[];
+  latestCompleteUtterances: string[];
+  committedUtteranceCount: number;
+  currentMessageStreaming: boolean;
+  currentMessageComplete: boolean;
   seenQuestionCalls: Set<string>;
 };
 
 export default function piSpeakPrototype(pi: ExtensionAPI) {
   const state: SpeechState = {
-    enabled: process.env.PI_SPEAK_ENABLED !== "0",
-    paused: false,
+    mode: "gagged",
     processing: false,
     queue: [],
     generation: 0,
-    markdownCarry: "",
-    proseBuffer: "",
-    insideFence: false,
+    messageMarkdown: "",
     currentUtterances: [],
-    lastUtterances: [],
+    latestCompleteUtterances: [],
+    committedUtteranceCount: 0,
+    currentMessageStreaming: false,
+    currentMessageComplete: false,
     seenQuestionCalls: new Set(),
   };
 
@@ -50,100 +50,93 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     const ctx = state.activeContext;
     if (!ctx?.hasUI) return;
 
-    let label = "speech on";
-    if (!state.enabled) label = "speech off";
-    else if (state.paused) label = "speech paused";
-    else if (state.processing || state.queue.length > 0) label = `speaking (${state.queue.length} queued)`;
+    let label: string = state.mode;
+    if (state.mode === "talking" && (state.processing || state.queue.length > 0)) {
+      label = `talking (${state.queue.length} queued)`;
+    }
 
     ctx.ui.setStatus(STATUS_ID, label);
   }
 
   function resetAccumulator() {
-    state.markdownCarry = "";
-    state.proseBuffer = "";
-    state.insideFence = false;
+    state.messageMarkdown = "";
+  }
+
+  function stripFencedCode(markdown: string): string {
+    let fence: { marker: "`" | "~"; length: number } | undefined;
+    const prose: string[] = [];
+
+    for (const line of markdown.split(/\r?\n/)) {
+      const indent = line.match(/^ */)?.[0].length ?? 0;
+      const candidate = indent <= 3 ? line.slice(indent) : "";
+      const run = candidate.match(/^(`+|~+)/)?.[0];
+
+      if (!fence) {
+        if (run && run.length >= 3) {
+          fence = { marker: run[0] as "`" | "~", length: run.length };
+        } else {
+          prose.push(line);
+        }
+        continue;
+      }
+
+      if (
+        run &&
+        run[0] === fence.marker &&
+        run.length >= fence.length &&
+        candidate.slice(run.length).trim() === ""
+      ) {
+        fence = undefined;
+      }
+    }
+
+    return prose.join("\n");
   }
 
   function cleanForSpeech(text: string): string {
     return text
+      .replace(/\$\$[\s\S]*?\$\$/g, " ")
+      .replace(/\\\[[\s\S]*?\\\]/g, " ")
+      .replace(/\\begin\{([^}]+)}[\s\S]*?\\end\{\1}/g, " ")
+      .replace(/\\\([\s\S]*?\\\)/g, " ")
+      .replace(/\$[\s\S]*?\$/g, " ")
       .replace(/\[([^\]]+)]\([^)]*\)/g, "$1")
-      .replace(/`[^`]*`/g, "")
+      .replace(/(`+)([^`\n]+)\1/g, "$2")
       .replace(/https?:\/\/\S+/g, "")
       .replace(/^\s{0,3}(?:#{1,6}|[-*+] |\d+[.)] )/gm, "")
       .replace(/[>*_~]/g, "")
+      .replace(/(^|\s)[,;:]+(?=\s|$)/g, "$1")
+      .replace(/\b(?:and|or)\s+(?=[.!?](?:\s|$))/gi, "")
+      .replace(/\s+([.!?])/g, "$1")
       .replace(/\s+/g, " ")
       .trim();
   }
 
-  function enqueue(text: string, remember = true) {
-    if (!state.enabled) return;
+  function captureUtterance(text: string) {
     const cleaned = cleanForSpeech(text);
-    if (!cleaned) return;
+    if (cleaned) state.currentUtterances.push(cleaned);
+  }
 
-    state.queue.push(cleaned);
-    if (remember) state.currentUtterances.push(cleaned);
+  function enqueueSpeech(text: string) {
+    if (!text || state.mode === "gagged") return;
+
+    state.queue.push(text);
     updateStatus();
-    void drainQueue();
+    if (state.mode === "talking") void drainQueue();
   }
 
-  function findBoundary(text: string): number {
-    const sentence = /[.!?](?:["')\]]{0,2})(?:\s+|$)/g.exec(text);
-    const paragraph = /\n\s*\n/.exec(text);
-
-    const sentenceEnd = sentence ? sentence.index + sentence[0].length : -1;
-    const paragraphEnd = paragraph ? paragraph.index + paragraph[0].length : -1;
-
-    if (sentenceEnd >= 0 && paragraphEnd >= 0) return Math.min(sentenceEnd, paragraphEnd);
-    return Math.max(sentenceEnd, paragraphEnd);
-  }
-
-  function drainProse(flush: boolean) {
-    while (state.proseBuffer) {
-      let cut = findBoundary(state.proseBuffer);
-
-      if (cut < 0 && state.proseBuffer.length > MAX_CHUNK_LENGTH) {
-        cut = state.proseBuffer.lastIndexOf(" ", MAX_CHUNK_LENGTH);
-        if (cut < MAX_CHUNK_LENGTH / 2) cut = MAX_CHUNK_LENGTH;
-      }
-
-      if (cut < 0) {
-        if (flush) {
-          enqueue(state.proseBuffer);
-          state.proseBuffer = "";
-        }
-        return;
-      }
-
-      enqueue(state.proseBuffer.slice(0, cut));
-      state.proseBuffer = state.proseBuffer.slice(cut);
-    }
+  function enqueueUncommittedUtterances() {
+    const utterances = state.currentUtterances.slice(state.committedUtteranceCount);
+    state.committedUtteranceCount = state.currentUtterances.length;
+    enqueueSpeech(utterances.join(" "));
   }
 
   function ingestMarkdown(delta: string, flush = false) {
-    state.markdownCarry += delta;
-    const safeEnd = flush ? state.markdownCarry.length : Math.max(0, state.markdownCarry.length - 2);
-    let index = 0;
-    let prose = "";
+    state.messageMarkdown += delta;
+    if (!flush) return;
 
-    while (index < safeEnd) {
-      const marker = state.markdownCarry.slice(index, index + 3);
-      if (marker === "```" || marker === "~~~") {
-        state.insideFence = !state.insideFence;
-        index += 3;
-        continue;
-      }
-
-      if (!state.insideFence) prose += state.markdownCarry[index];
-      index += 1;
-    }
-
-    state.markdownCarry = state.markdownCarry.slice(index);
-    state.proseBuffer += prose;
-    drainProse(flush);
-
-    if (flush) {
-      resetAccumulator();
-    }
+    captureUtterance(stripFencedCode(state.messageMarkdown));
+    resetAccumulator();
   }
 
   function stopPlayback(clearQueue = true) {
@@ -161,7 +154,6 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
 
     if (clearQueue) state.queue = [];
     state.processing = false;
-    state.paused = false;
     updateStatus();
   }
 
@@ -203,6 +195,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       "pipe:0",
     ]);
     state.currentPlayer = player;
+    if (state.mode === "paused") player.kill("SIGSTOP");
 
     let stderr = "";
     player.stderr.on("data", (chunk) => {
@@ -219,13 +212,13 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
   }
 
   async function drainQueue() {
-    if (state.processing || state.paused || !state.enabled) return;
+    if (state.processing || state.mode !== "talking") return;
     state.processing = true;
     updateStatus();
 
     const generation = state.generation;
     try {
-      while (state.enabled && !state.paused && state.queue.length > 0 && generation === state.generation) {
+      while (state.mode === "talking" && state.queue.length > 0 && generation === state.generation) {
         const text = state.queue.shift();
         if (!text) continue;
 
@@ -235,9 +228,11 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
           if (generation !== state.generation || (error instanceof Error && error.name === "AbortError")) break;
           notify(state.activeContext, error instanceof Error ? error.message : String(error), "error");
         } finally {
-          state.currentController = undefined;
-          state.currentPlayer = undefined;
-          updateStatus();
+          if (generation === state.generation) {
+            state.currentController = undefined;
+            state.currentPlayer = undefined;
+            updateStatus();
+          }
         }
       }
     } finally {
@@ -268,37 +263,77 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     });
   }
 
+  function startTalking(ctx: ExtensionContext, utterances: string[], message: string): boolean {
+    if (!process.env.OPENAI_API_KEY) {
+      notify(ctx, "OPENAI_API_KEY is not set", "error");
+      return false;
+    }
+
+    stopPlayback();
+    state.mode = "talking";
+    state.queue.push(...utterances);
+    notify(ctx, message);
+    updateStatus();
+    void drainQueue();
+    return true;
+  }
+
+  function describeState(): string {
+    const activity = state.processing ? "playing" : "idle";
+    const message = state.currentMessageStreaming
+      ? "newest message streaming"
+      : state.currentMessageComplete
+        ? "newest message complete"
+        : "no current complete message";
+    return `${state.mode}; ${activity}; ${state.queue.length} queued; ${message}; voice ${process.env.PI_SPEAK_VOICE || "marin"}`;
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     state.activeContext = ctx;
+    state.mode = "gagged";
+    state.currentMessageStreaming = false;
+    state.currentMessageComplete = false;
+    state.latestCompleteUtterances = [];
     state.seenQuestionCalls.clear();
 
     if (!process.env.OPENAI_API_KEY) {
-      state.enabled = false;
-      notify(ctx, "Pi Talk disabled: OPENAI_API_KEY is not set", "warning");
+      notify(ctx, "Pi Talk is gagged; OPENAI_API_KEY is not set", "warning");
     } else {
-      notify(ctx, "Pi Talk prototype loaded. Use /speak for controls.");
+      notify(ctx, "Pi Talk prototype loaded gagged. Use /talk to begin.");
     }
     updateStatus();
   });
 
   pi.on("message_start", async (event) => {
     if (event.message.role !== "assistant") return;
+
+    if (state.mode === "talking") stopPlayback();
     resetAccumulator();
     state.currentUtterances = [];
+    state.committedUtteranceCount = 0;
+    state.currentMessageStreaming = true;
+    state.currentMessageComplete = false;
+    updateStatus();
   });
 
   pi.on("message_update", async (event) => {
-    if (!state.enabled || event.assistantMessageEvent.type !== "text_delta") return;
+    if (event.assistantMessageEvent.type !== "text_delta") return;
     ingestMarkdown(event.assistantMessageEvent.delta);
   });
 
   pi.on("message_end", async (event) => {
     if (event.message.role !== "assistant") return;
 
-    if (event.message.stopReason === "aborted") resetAccumulator();
-    else ingestMarkdown("", true);
-
-    state.lastUtterances = [...state.currentUtterances];
+    state.currentMessageStreaming = false;
+    if (event.message.stopReason === "aborted") {
+      resetAccumulator();
+      state.currentMessageComplete = false;
+    } else {
+      ingestMarkdown("", true);
+      state.currentMessageComplete = true;
+      state.latestCompleteUtterances = [...state.currentUtterances];
+      enqueueUncommittedUtterances();
+    }
   });
 
   pi.on("tool_execution_start", async (event) => {
@@ -306,78 +341,91 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     if (!normalizedName.includes("askuserquestion") || state.seenQuestionCalls.has(event.toolCallId)) return;
 
     state.seenQuestionCalls.add(event.toolCallId);
+    const messageWasComplete = state.currentMessageComplete;
     ingestMarkdown("", true);
 
     const utterances = questionText(event.args);
-    for (const utterance of utterances) enqueue(utterance);
-    if (utterances.length > 0) state.lastUtterances = [...utterances];
+    for (const utterance of utterances) captureUtterance(utterance);
+    if (messageWasComplete) {
+      state.latestCompleteUtterances = [...state.currentUtterances];
+      enqueueUncommittedUtterances();
+    }
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    state.mode = "gagged";
     stopPlayback();
     resetAccumulator();
     if (ctx.hasUI) ctx.ui.setStatus(STATUS_ID, undefined);
     state.activeContext = undefined;
   });
 
-  pi.registerCommand("speak", {
-    description: "Control OpenAI speech: on, off, stop, pause, resume, replay, test, status",
+  pi.registerCommand("talk", {
+    description: "Speak the newest assistant message and automatically speak new messages",
     handler: async (args, ctx) => {
       const command = args.trim().toLowerCase();
 
-      switch (command) {
-        case "on":
-          if (!process.env.OPENAI_API_KEY) {
-            notify(ctx, "OPENAI_API_KEY is not set", "error");
-            break;
-          }
-          state.enabled = true;
-          notify(ctx, "Speech enabled");
-          void drainQueue();
-          break;
-        case "off":
-          state.enabled = false;
-          stopPlayback();
-          resetAccumulator();
-          notify(ctx, "Speech disabled");
-          break;
-        case "stop":
-          stopPlayback();
-          resetAccumulator();
-          notify(ctx, "Speech stopped");
-          break;
-        case "pause":
-          state.paused = true;
-          state.currentPlayer?.kill("SIGSTOP");
-          notify(ctx, "Speech paused");
-          break;
-        case "resume":
-          state.paused = false;
-          state.currentPlayer?.kill("SIGCONT");
-          notify(ctx, "Speech resumed");
-          void drainQueue();
-          break;
-        case "replay":
-          if (state.lastUtterances.length === 0) notify(ctx, "Nothing to replay", "warning");
-          else {
-            state.queue.push(...state.lastUtterances);
-            notify(ctx, "Replaying last response");
-            void drainQueue();
-          }
-          break;
-        case "test":
-          enqueue("Pi speech is ready.", false);
-          break;
-        case "status":
-          notify(
-            ctx,
-            `Speech ${state.enabled ? "on" : "off"}; ${state.paused ? "paused" : "running"}; ${state.queue.length} queued; voice ${process.env.PI_SPEAK_VOICE || "marin"}`,
-          );
-          break;
-        default:
-          notify(ctx, "Usage: /speak on|off|stop|pause|resume|replay|test|status");
+      if (command === "status") {
+        notify(ctx, describeState());
+      } else if (command === "test") {
+        startTalking(ctx, ["Pi Talk is ready."], "Talking; playing the audio test");
+      } else if (command) {
+        notify(ctx, "Usage: /talk [test|status]", "warning");
+      } else {
+        const newestUtterances = state.currentMessageStreaming
+          ? []
+          : state.currentMessageComplete
+            ? state.currentUtterances
+            : state.latestCompleteUtterances;
+        const newest = newestUtterances.join(" ");
+        startTalking(
+          ctx,
+          newest ? [newest] : [],
+          newest
+            ? "Talking from the start of the newest complete message"
+            : "Talking; waiting for the newest message to finish",
+        );
       }
+    },
+  });
 
+  pi.registerCommand("pause", {
+    description: "Freeze speech at its exact playback position",
+    handler: async (_args, ctx) => {
+      if (state.mode === "gagged") {
+        notify(ctx, "Pi Talk is gagged; use /talk first", "warning");
+      } else if (state.mode === "paused") {
+        notify(ctx, "Speech is already paused");
+      } else {
+        state.mode = "paused";
+        state.currentPlayer?.kill("SIGSTOP");
+        notify(ctx, "Speech paused at the current position");
+      }
+      updateStatus();
+    },
+  });
+
+  pi.registerCommand("unpause", {
+    description: "Continue speech from its exact paused position",
+    handler: async (_args, ctx) => {
+      if (state.mode !== "paused") {
+        notify(ctx, "Speech is not paused", "warning");
+      } else {
+        state.mode = "talking";
+        state.currentPlayer?.kill("SIGCONT");
+        notify(ctx, "Speech continued from the paused position");
+        void drainQueue();
+      }
+      updateStatus();
+    },
+  });
+
+  pi.registerCommand("gag", {
+    description: "Stop speech, clear its queue, and disable automatic speaking",
+    handler: async (_args, ctx) => {
+      state.mode = "gagged";
+      stopPlayback();
+      notify(ctx, "Pi Talk gagged");
       updateStatus();
     },
   });
