@@ -8,7 +8,7 @@ import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 const STATUS_ID = "pi-talk";
 const OPENAI_SPEECH_URL = "https://api.openai.com/v1/audio/speech";
 const MIN_PLAYBACK_SPEED = 0.5;
-const MAX_PLAYBACK_SPEED = 2;
+const MAX_PLAYBACK_SPEED = 3;
 const DEFAULT_PLAYBACK_SPEED = 1.25;
 const COARSE_SPEED_STEP = 0.1;
 const FINE_SPEED_STEP = 0.05;
@@ -39,12 +39,24 @@ function clampPlaybackSpeed(speed: number): number {
 }
 
 function configuredPlaybackSpeed(): number {
-  const configured = Number(process.env.PI_TALK_SPEED);
-  return Number.isFinite(configured) ? clampPlaybackSpeed(configured) : DEFAULT_PLAYBACK_SPEED;
+  const raw = process.env.PI_TALK_SPEED?.trim();
+  if (!raw) return DEFAULT_PLAYBACK_SPEED;
+
+  const configured = Number(raw);
+  return Number.isFinite(configured) && configured >= MIN_PLAYBACK_SPEED && configured <= MAX_PLAYBACK_SPEED
+    ? configured
+    : DEFAULT_PLAYBACK_SPEED;
 }
 
 function formatPlaybackSpeed(speed: number): string {
   return `${speed.toFixed(2)}×`;
+}
+
+function atempoFilter(playbackSpeed: number): string {
+  if (playbackSpeed <= 2) return `atempo=${playbackSpeed.toFixed(2)}`;
+
+  const factor = Math.sqrt(playbackSpeed).toFixed(5);
+  return `atempo=${factor},atempo=${factor}`;
 }
 
 export default function piSpeakPrototype(pi: ExtensionAPI) {
@@ -80,7 +92,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
   }
 
   async function openPlaybackSpeedControl(ctx: ExtensionContext) {
-    const selected = await ctx.ui.custom<number | undefined>((tui, theme, _keybindings, done) => {
+    const selected = await ctx.ui.custom<number | undefined>((tui, theme, keybindings, done) => {
       let draft = state.playbackSpeed;
 
       const adjust = (delta: number) => {
@@ -103,18 +115,37 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
             "",
             `${MIN_PLAYBACK_SPEED.toFixed(2)}× ${track} ${MAX_PLAYBACK_SPEED.toFixed(2)}×`,
             theme.fg("accent", theme.bold(formatPlaybackSpeed(draft))),
+            theme.fg("muted", `Playback: ${state.mode}`),
             "",
-            theme.fg("muted", "←/→ 0.10× · Shift+←/→ 0.05× · r reset"),
-            theme.fg("muted", "Enter apply · Esc cancel · applies to next utterance"),
+            theme.fg("muted", "j faster · k slower (0.10×) · Shift+j/k 0.05×"),
+            theme.fg("muted", "←/→ also adjust · Space pause/unpause · r reset"),
+            theme.fg("muted", "Enter apply · Esc/Ctrl+C cancel · applies to next utterance"),
           ].map((line) => truncateToWidth(line, width));
         },
         invalidate() {},
         handleInput(data: string) {
-          if (matchesKey(data, Key.shift("left"))) adjust(-FINE_SPEED_STEP);
-          else if (matchesKey(data, Key.shift("right"))) adjust(FINE_SPEED_STEP);
+          if (matchesKey(data, Key.shift("j"))) adjust(FINE_SPEED_STEP);
+          else if (matchesKey(data, Key.shift("k"))) adjust(-FINE_SPEED_STEP);
+          else if (matchesKey(data, "j")) adjust(COARSE_SPEED_STEP);
+          else if (matchesKey(data, "k")) adjust(-COARSE_SPEED_STEP);
           else if (matchesKey(data, Key.left) || data === "[") adjust(-COARSE_SPEED_STEP);
           else if (matchesKey(data, Key.right) || data === "]") adjust(COARSE_SPEED_STEP);
-          else if (matchesKey(data, Key.home)) {
+          else if (matchesKey(data, Key.space)) {
+            if (state.mode === "talking") {
+              state.mode = "paused";
+              state.currentPlayer?.kill("SIGSTOP");
+              notify(ctx, "Speech paused at the current position");
+            } else if (state.mode === "paused") {
+              state.mode = "talking";
+              state.currentPlayer?.kill("SIGCONT");
+              notify(ctx, "Speech continued from the paused position");
+              void drainQueue();
+            } else {
+              notify(ctx, "Pi Talk is gagged; use /talk first", "warning");
+            }
+            updateStatus();
+            tui.requestRender();
+          } else if (matchesKey(data, Key.home)) {
             draft = MIN_PLAYBACK_SPEED;
             tui.requestRender();
           } else if (matchesKey(data, Key.end)) {
@@ -123,8 +154,8 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
           } else if (data.toLowerCase() === "r") {
             draft = DEFAULT_PLAYBACK_SPEED;
             tui.requestRender();
-          } else if (matchesKey(data, Key.enter)) done(draft);
-          else if (matchesKey(data, Key.escape)) done(undefined);
+          } else if (matchesKey(data, Key.enter) || keybindings.matches(data, "tui.select.confirm")) done(draft);
+          else if (matchesKey(data, Key.escape) || keybindings.matches(data, "tui.select.cancel")) done(undefined);
         },
       };
     });
@@ -273,7 +304,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       "-loglevel",
       "error",
       "-af",
-      `atempo=${playbackSpeed.toFixed(2)}`,
+      atempoFilter(playbackSpeed),
       "-i",
       "pipe:0",
     ]);
@@ -504,10 +535,14 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("speed", {
-    description: "Open the playback-speed slider or set a rate from 0.50× to 2.00×",
+    description: "Open the playback-speed slider or set a rate from 0.50× to 3.00×",
     handler: async (args, ctx) => {
       const command = args.trim().toLowerCase();
       if (!command) {
+        if (ctx.mode !== "tui") {
+          notify(ctx, "The speed slider requires TUI mode; use /speed <0.50-3.00> instead", "warning");
+          return;
+        }
         await openPlaybackSpeedControl(ctx);
         return;
       }
@@ -521,7 +556,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
 
       const requested = Number(command.replace(/[x×]$/, ""));
       if (!Number.isFinite(requested) || requested < MIN_PLAYBACK_SPEED || requested > MAX_PLAYBACK_SPEED) {
-        notify(ctx, "Usage: /speed [0.50-2.00|reset]", "error");
+        notify(ctx, "Usage: /speed [0.50-3.00|reset]", "error");
         return;
       }
 
