@@ -22,7 +22,7 @@ Included:
 - Explicit Gagged, Talking, and Paused playback states
 - `/talk`, `/pause`, `/unpause`, and `/gag` controls
 - `/speed` keyboard slider and direct speed setting
-- `ffplay` `atempo` playback from `0.50×` to `2.00×`
+- `ffplay` `atempo` playback from `0.50×` to `3.00×`
 - macOS playback through `ffplay`
 
 Not included:
@@ -85,7 +85,7 @@ pi -e ~/Developer/pi-talk/src/index.ts
 
 A newer assistant message interrupts stale audio while Talking. Pi Talk waits for that message to finish, then speaks it in one request for natural continuity. While Paused, the exact position and queued backlog are preserved for `/unpause`; `/talk` instead discards that stale backlog and starts the newest complete message from its beginning.
 
-The `/speed` slider uses `←`/`→` for `0.10×` changes, `Shift+←`/`Shift+→` for `0.05×`, `r` to reset, `Enter` to apply, and `Esc` to cancel. A changed speed applies to the next utterance; active audio keeps its current rate. Slider changes are in-memory only, while `PI_TALK_SPEED` sets the startup default.
+The `/speed` slider uses `j` to speed up and `k` to slow down by `0.10×`. `Shift+j`/`Shift+k` change in the same directions by `0.05×`; `←`/`→` remain optional coarse controls. Space pauses or unpauses playback without closing the menu. `r` resets, Enter applies, and Escape or Ctrl+C cancels. A changed speed applies to the next utterance; active audio keeps its current rate. Rates above `2.00×` use chained `atempo` filters to avoid FFmpeg sample skipping. Slider changes are in-memory only, while a valid `PI_TALK_SPEED` sets the startup default; invalid or out-of-range values fall back to `1.25×`.
 
 Semantic 2–3 sentence chunks with one-ahead prefetch remain a possible follow-up if waiting for message completion feels too slow.
 
@@ -98,8 +98,9 @@ Semantic 2–3 sentence chunks with one-ahead prefetch remain a possible follow-
 5. Ask for fenced code and inline code — speak prose and inline code, but skip fences. Common LaTeX filtering is best effort.
 6. `/pause` during a long sentence, then `/unpause` — continue from the exact position.
 7. Pause old audio, produce a newer response, then `/talk` — discard the backlog and start the newer response from its beginning.
-8. Open `/speed`, set `1.50×`, and confirm the next response is faster without a pitch shift.
-9. Change speed during playback and confirm only the following utterance uses the new rate.
-10. `/gag` or exit Pi during playback — audio should stop immediately.
+8. Open `/speed`, use `j` and `k`, set `1.50×`, and confirm the next response is faster without a pitch shift.
+9. Set `3.00×` and confirm chained tempo filters remain intelligible without pitch shift.
+10. Change speed during playback and confirm only the following utterance uses the new rate.
+11. `/gag` or exit Pi during playback — audio should stop immediately.
 
 Record what feels wrong in [NOTES.md](NOTES.md). The prototype is successful when it reveals the desired queueing, interruption, and question-reading behavior—not when the code looks production-ready.

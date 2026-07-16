@@ -43,9 +43,13 @@ Use `/talk`, `/pause`, `/unpause`, and `/gag`. Preserve inline code text while s
 
 ### Decision under test
 
-Pi exposes keyboard-driven custom TUI components but no documented native slider or mouse/drag event API. `/speed` therefore opens a keyboard slider: arrows adjust the value, `r` resets, Enter applies, and Escape cancels. `/speed <rate>` remains available for direct control.
+Pi exposes keyboard-driven custom TUI components but no documented native slider or mouse/drag event API. `/speed` therefore opens a keyboard slider: `j` speeds up, `k` slows down, shifted `j`/`k` make fine changes, arrows remain optional coarse controls, Space pauses/unpauses playback in place, `r` resets, Enter applies, and Escape or Ctrl+C cancels. `/speed <rate>` remains available for direct control and non-TUI modes.
 
-The prototype defaults to `1.25×`, limits speed to `0.50×–2.00×`, applies changes to the next utterance through `ffplay -af atempo=…`, and uses `PI_TALK_SPEED` only as the startup override. UI changes are intentionally in-memory until package configuration is designed.
+The prototype defaults to `1.25×`, limits speed to `0.50×–3.00×`, applies changes to the next utterance through `ffplay -af atempo=…`, and uses a valid `PI_TALK_SPEED` only as the startup override. Invalid values fall back to the default. Rates above `2.00×` chain two tempo factors so no individual `atempo` filter exceeds `2.00×`. UI changes are intentionally in-memory until package configuration is designed.
+
+### Cross-review
+
+An independent 5.6-sol reviewer at xhigh found no blockers. Its verified findings led to strict environment parsing, a TUI-mode slider guard, configurable Pi confirm/cancel bindings, and chained tempo filters above `2.00×`.
 
 ### Observe
 
@@ -53,4 +57,5 @@ The prototype defaults to `1.25×`, limits speed to `0.50×–2.00×`, applies c
 - Whether coarse (`0.10×`) and fine (`0.05×`) keyboard changes feel right: controls, reset, apply, and footer status passed.
 - Whether `1.50×` is noticeably faster without pitch distortion: passed for the diagnostic and a regular response.
 - Whether changing speed leaves active audio untouched and affects the next utterance: next-utterance speed change passed.
-- Preferred default, minimum, maximum, and step sizes: `1.25×` default; `0.50×–2.00×`; `0.10×` coarse and `0.05×` fine steps accepted.
+- Preferred default, minimum, maximum, and step sizes: `1.25×` default; `0.50×–3.00×`; `0.10×` coarse and `0.05×` fine steps. Final mapping is `j` faster, `k` slower, with shifted keys for fine changes; `3.00×` passed live playback.
+- Whether Space in the slider pauses and unpauses without closing it: passed; exact-position audio and rendered state both updated.
