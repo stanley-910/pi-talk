@@ -2,19 +2,39 @@
 
 ## Question
 
-Does sentence-level OpenAI speech make Pi grilling sessions easier to follow, and do the queue/interruption controls feel right?
+Do whole-response playback and the locked `/talk`, `/pause`, `/unpause`, and `/gag` semantics feel correct during real Pi grilling sessions?
 
 ## Verdict
 
-_Try the prototype, then record the answer here before deleting it or turning it into a real package._
+Validated for the v0.1 specification. Prioritize one OpenAI request per complete assistant response: it sounded substantially more natural than separate sentence requests. Keep semantic 2–3 sentence chunks with one-ahead prefetch as a future option if completion delay becomes a problem.
+
+Use `/talk`, `/pause`, `/unpause`, and `/gag`. Preserve inline code text while suppressing fenced code. Common delimited LaTeX filtering is best effort and non-blocking for v0.1.
+
+## Confirmed
+
+- OpenAI `gpt-4o-mini-tts` returned streamed WAV successfully.
+- `ffplay` completed successfully and Stanley clearly heard the `marin` voice diagnostic.
+- `/talk`, `/gag`, and `/pause` worked during the first live pass.
+- `/resume` conflicted with Pi's built-in command, so the prototype renamed the speech action to `/unpause`.
+- After restart, `/pause` → `/unpause` continued from the exact playback position without a command conflict.
+- `/talk` discarded paused old audio and started the newer message from its beginning.
+- A structured `ask_user_question` was spoken exactly once with concise option labels and no descriptions.
+- Prose before and after a fenced JavaScript block was spoken while the code remained silent.
+- Separate sentence requests sounded slow and unnatural. Measured response waits were about 4.2 s cold, then 1.0 s and 0.37 s between sentences.
+- A whole-paragraph request sounded substantially more natural and seamless.
+- Two prefetched semantic chunks had no measured inter-chunk wait and sounded close to the whole paragraph, so chunking remains a future option while whole-response playback is prioritized.
 
 ## Observe
 
-- Time until the first spoken sentence:
-- Whether sentence boundaries sound natural:
-- Whether question options are concise enough:
-- Whether old speech should stop automatically on new user input:
-- Whether fenced code or Markdown leaks into speech:
-- Whether pause/resume is useful or stop/replay is enough:
-- Preferred voice and speed:
-- Any duplicate, skipped, or out-of-order speech:
+- Time from message completion until speech begins: acceptable in the first live pass.
+- Whether whole-response prosody sounds natural: yes.
+- Whether question options are concise enough: yes; labels played once and descriptions stayed silent.
+- Whether a newer assistant message interrupts stale speech while Talking: yes.
+- Whether `/pause` and `/unpause` preserve the exact playback position: yes.
+- Whether `/talk` during stale or paused audio starts the newest message from its beginning: yes.
+- Whether `/gag` stops immediately and prevents automatic speech: yes in the first live pass.
+- Whether fenced code or Markdown leaks into speech: tested fenced code stayed silent.
+- Whether inline code remains understandable when spoken: yes.
+- Preferred voice and speed: not decided; tests used the default `marin` voice.
+- Any duplicate, skipped, or out-of-order speech: none observed.
+- LaTeX edge case: removing a list of equations left orphan commas that were spoken; punctuation cleanup was added, but deeper LaTeX handling is intentionally out of scope.
