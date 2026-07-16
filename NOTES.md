@@ -38,3 +38,19 @@ Use `/talk`, `/pause`, `/unpause`, and `/gag`. Preserve inline code text while s
 - Preferred voice and speed: not decided; tests used the default `marin` voice.
 - Any duplicate, skipped, or out-of-order speech: none observed.
 - LaTeX edge case: removing a list of equations left orphan commas that were spoken; punctuation cleanup was added, but deeper LaTeX handling is intentionally out of scope.
+
+## Playback-speed control
+
+### Decision under test
+
+Pi exposes keyboard-driven custom TUI components but no documented native slider or mouse/drag event API. `/speed` therefore opens a keyboard slider: arrows adjust the value, `r` resets, Enter applies, and Escape cancels. `/speed <rate>` remains available for direct control.
+
+The prototype defaults to `1.25×`, limits speed to `0.50×–2.00×`, applies changes to the next utterance through `ffplay -af atempo=…`, and uses `PI_TALK_SPEED` only as the startup override. UI changes are intentionally in-memory until package configuration is designed.
+
+### Observe
+
+- Whether the slider opens and renders correctly at normal and narrow terminal widths: normal-width rendering passed.
+- Whether coarse (`0.10×`) and fine (`0.05×`) keyboard changes feel right: controls, reset, apply, and footer status passed.
+- Whether `1.50×` is noticeably faster without pitch distortion: passed for the diagnostic and a regular response.
+- Whether changing speed leaves active audio untouched and affects the next utterance: next-utterance speed change passed.
+- Preferred default, minimum, maximum, and step sizes: `1.25×` default; `0.50×–2.00×`; `0.10×` coarse and `0.05×` fine steps accepted.

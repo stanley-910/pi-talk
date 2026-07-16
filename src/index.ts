@@ -3,15 +3,22 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 
 const STATUS_ID = "pi-talk";
 const OPENAI_SPEECH_URL = "https://api.openai.com/v1/audio/speech";
+const MIN_PLAYBACK_SPEED = 0.5;
+const MAX_PLAYBACK_SPEED = 2;
+const DEFAULT_PLAYBACK_SPEED = 1.25;
+const COARSE_SPEED_STEP = 0.1;
+const FINE_SPEED_STEP = 0.05;
 
 type UiLevel = "info" | "warning" | "error";
 type SpeechMode = "gagged" | "talking" | "paused";
 
 type SpeechState = {
   mode: SpeechMode;
+  playbackSpeed: number;
   processing: boolean;
   queue: string[];
   currentController?: AbortController;
@@ -27,9 +34,23 @@ type SpeechState = {
   seenQuestionCalls: Set<string>;
 };
 
+function clampPlaybackSpeed(speed: number): number {
+  return Math.round(Math.min(MAX_PLAYBACK_SPEED, Math.max(MIN_PLAYBACK_SPEED, speed)) * 100) / 100;
+}
+
+function configuredPlaybackSpeed(): number {
+  const configured = Number(process.env.PI_TALK_SPEED);
+  return Number.isFinite(configured) ? clampPlaybackSpeed(configured) : DEFAULT_PLAYBACK_SPEED;
+}
+
+function formatPlaybackSpeed(speed: number): string {
+  return `${speed.toFixed(2)}×`;
+}
+
 export default function piSpeakPrototype(pi: ExtensionAPI) {
   const state: SpeechState = {
     mode: "gagged",
+    playbackSpeed: configuredPlaybackSpeed(),
     processing: false,
     queue: [],
     generation: 0,
@@ -55,7 +76,67 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       label = `talking (${state.queue.length} queued)`;
     }
 
-    ctx.ui.setStatus(STATUS_ID, label);
+    ctx.ui.setStatus(STATUS_ID, `${label} · ${formatPlaybackSpeed(state.playbackSpeed)}`);
+  }
+
+  async function openPlaybackSpeedControl(ctx: ExtensionContext) {
+    const selected = await ctx.ui.custom<number | undefined>((tui, theme, _keybindings, done) => {
+      let draft = state.playbackSpeed;
+
+      const adjust = (delta: number) => {
+        draft = clampPlaybackSpeed(draft + delta);
+        tui.requestRender();
+      };
+
+      return {
+        render(width: number) {
+          const trackWidth = Math.max(5, Math.min(28, width - 16));
+          const ratio = (draft - MIN_PLAYBACK_SPEED) / (MAX_PLAYBACK_SPEED - MIN_PLAYBACK_SPEED);
+          const thumb = Math.round(ratio * (trackWidth - 1));
+          const track =
+            theme.fg("accent", "━".repeat(thumb)) +
+            theme.fg("accent", "●") +
+            theme.fg("dim", "─".repeat(trackWidth - thumb - 1));
+
+          return [
+            theme.fg("accent", theme.bold("Pi Talk playback speed")),
+            "",
+            `${MIN_PLAYBACK_SPEED.toFixed(2)}× ${track} ${MAX_PLAYBACK_SPEED.toFixed(2)}×`,
+            theme.fg("accent", theme.bold(formatPlaybackSpeed(draft))),
+            "",
+            theme.fg("muted", "←/→ 0.10× · Shift+←/→ 0.05× · r reset"),
+            theme.fg("muted", "Enter apply · Esc cancel · applies to next utterance"),
+          ].map((line) => truncateToWidth(line, width));
+        },
+        invalidate() {},
+        handleInput(data: string) {
+          if (matchesKey(data, Key.shift("left"))) adjust(-FINE_SPEED_STEP);
+          else if (matchesKey(data, Key.shift("right"))) adjust(FINE_SPEED_STEP);
+          else if (matchesKey(data, Key.left) || data === "[") adjust(-COARSE_SPEED_STEP);
+          else if (matchesKey(data, Key.right) || data === "]") adjust(COARSE_SPEED_STEP);
+          else if (matchesKey(data, Key.home)) {
+            draft = MIN_PLAYBACK_SPEED;
+            tui.requestRender();
+          } else if (matchesKey(data, Key.end)) {
+            draft = MAX_PLAYBACK_SPEED;
+            tui.requestRender();
+          } else if (data.toLowerCase() === "r") {
+            draft = DEFAULT_PLAYBACK_SPEED;
+            tui.requestRender();
+          } else if (matchesKey(data, Key.enter)) done(draft);
+          else if (matchesKey(data, Key.escape)) done(undefined);
+        },
+      };
+    });
+
+    if (selected === undefined) {
+      notify(ctx, `Playback speed unchanged at ${formatPlaybackSpeed(state.playbackSpeed)}`);
+      return;
+    }
+
+    state.playbackSpeed = selected;
+    updateStatus();
+    notify(ctx, `Playback speed set to ${formatPlaybackSpeed(state.playbackSpeed)} for the next utterance`);
   }
 
   function resetAccumulator() {
@@ -157,7 +238,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     updateStatus();
   }
 
-  async function playWithOpenAI(text: string, generation: number) {
+  async function playWithOpenAI(text: string, generation: number, playbackSpeed: number) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
 
@@ -191,6 +272,8 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       "-autoexit",
       "-loglevel",
       "error",
+      "-af",
+      `atempo=${playbackSpeed.toFixed(2)}`,
       "-i",
       "pipe:0",
     ]);
@@ -223,7 +306,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
         if (!text) continue;
 
         try {
-          await playWithOpenAI(text, generation);
+          await playWithOpenAI(text, generation, state.playbackSpeed);
         } catch (error) {
           if (generation !== state.generation || (error instanceof Error && error.name === "AbortError")) break;
           notify(state.activeContext, error instanceof Error ? error.message : String(error), "error");
@@ -285,7 +368,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       : state.currentMessageComplete
         ? "newest message complete"
         : "no current complete message";
-    return `${state.mode}; ${activity}; ${state.queue.length} queued; ${message}; voice ${process.env.PI_SPEAK_VOICE || "marin"}`;
+    return `${state.mode}; ${activity}; ${state.queue.length} queued; ${message}; speed ${formatPlaybackSpeed(state.playbackSpeed)}; voice ${process.env.PI_SPEAK_VOICE || "marin"}`;
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -299,7 +382,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     if (!process.env.OPENAI_API_KEY) {
       notify(ctx, "Pi Talk is gagged; OPENAI_API_KEY is not set", "warning");
     } else {
-      notify(ctx, "Pi Talk prototype loaded gagged. Use /talk to begin.");
+      notify(ctx, `Pi Talk loaded gagged at ${formatPlaybackSpeed(state.playbackSpeed)}. Use /talk to begin.`);
     }
     updateStatus();
   });
@@ -417,6 +500,34 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
         void drainQueue();
       }
       updateStatus();
+    },
+  });
+
+  pi.registerCommand("speed", {
+    description: "Open the playback-speed slider or set a rate from 0.50× to 2.00×",
+    handler: async (args, ctx) => {
+      const command = args.trim().toLowerCase();
+      if (!command) {
+        await openPlaybackSpeedControl(ctx);
+        return;
+      }
+
+      if (command === "reset") {
+        state.playbackSpeed = DEFAULT_PLAYBACK_SPEED;
+        updateStatus();
+        notify(ctx, `Playback speed reset to ${formatPlaybackSpeed(state.playbackSpeed)} for the next utterance`);
+        return;
+      }
+
+      const requested = Number(command.replace(/[x×]$/, ""));
+      if (!Number.isFinite(requested) || requested < MIN_PLAYBACK_SPEED || requested > MAX_PLAYBACK_SPEED) {
+        notify(ctx, "Usage: /speed [0.50-2.00|reset]", "error");
+        return;
+      }
+
+      state.playbackSpeed = clampPlaybackSpeed(requested);
+      updateStatus();
+      notify(ctx, `Playback speed set to ${formatPlaybackSpeed(state.playbackSpeed)} for the next utterance`);
     },
   });
 
