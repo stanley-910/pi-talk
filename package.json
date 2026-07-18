@@ -2,10 +2,11 @@
   "name": "pi-talk",
   "version": "0.0.0",
   "private": true,
-  "description": "Throwaway Pi extension prototype for OpenAI text-to-speech",
+  "description": "Pi extension for OpenAI text-to-speech",
   "type": "module",
   "scripts": {
-    "start": "pi -e ./src/index.ts"
+    "start": "pi -e ./src/index.ts",
+    "test": "node --test test/*.test.ts"
   },
   "pi": {
     "extensions": [
