@@ -1,17 +1,23 @@
-import { once } from "node:events";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+  OPENAI_SPEECH_MODEL,
+  OPENAI_SPEECH_VOICE,
+  OpenAISpeechPlayback,
+  SpeechCancelledError,
+  SpeechError,
+  splitSpeechText,
+  stripDelimitedMath,
+} from "./speech.ts";
 
 const STATUS_ID = "pi-talk";
-const OPENAI_SPEECH_URL = "https://api.openai.com/v1/audio/speech";
 const MIN_PLAYBACK_SPEED = 0.5;
 const MAX_PLAYBACK_SPEED = 3;
 const DEFAULT_PLAYBACK_SPEED = 1.25;
 const COARSE_SPEED_STEP = 0.1;
 const FINE_SPEED_STEP = 0.05;
+const AI_VOICE_DISCLOSURE =
+  "AI voice: Pi Talk sends cleaned assistant text to OpenAI to generate speech. OpenAI may retain API content for up to 30 days for abuse monitoring unless your organization has approved data-retention controls. Audio is streamed to a local player and is not saved by Pi Talk.";
 
 type UiLevel = "info" | "warning" | "error";
 type SpeechMode = "gagged" | "talking" | "paused";
@@ -21,10 +27,10 @@ type SpeechState = {
   playbackSpeed: number;
   processing: boolean;
   queue: string[];
-  currentController?: AbortController;
-  currentPlayer?: ChildProcessWithoutNullStreams;
   generation: number;
   activeContext?: ExtensionContext;
+  playback?: OpenAISpeechPlayback;
+  disclosureShown: boolean;
   messageMarkdown: string;
   currentUtterances: string[];
   latestCompleteUtterances: string[];
@@ -52,13 +58,6 @@ function formatPlaybackSpeed(speed: number): string {
   return `${speed.toFixed(2)}×`;
 }
 
-function atempoFilter(playbackSpeed: number): string {
-  if (playbackSpeed <= 2) return `atempo=${playbackSpeed.toFixed(2)}`;
-
-  const factor = Math.sqrt(playbackSpeed).toFixed(5);
-  return `atempo=${factor},atempo=${factor}`;
-}
-
 export default function piSpeakPrototype(pi: ExtensionAPI) {
   const state: SpeechState = {
     mode: "gagged",
@@ -66,6 +65,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     processing: false,
     queue: [],
     generation: 0,
+    disclosureShown: false,
     messageMarkdown: "",
     currentUtterances: [],
     latestCompleteUtterances: [],
@@ -79,6 +79,31 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     if (ctx?.hasUI) ctx.ui.notify(message, level);
   }
 
+  function notifySpeechError(error: unknown) {
+    if (error instanceof SpeechCancelledError) return;
+    const message = error instanceof SpeechError ? error.userMessage : "Speech playback failed.";
+    notify(state.activeContext, message, "error");
+  }
+
+  function ensurePlayback(): OpenAISpeechPlayback | undefined {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return undefined;
+
+    state.playback ??= new OpenAISpeechPlayback({
+      apiKey,
+      playerCommand: process.env.PI_SPEAK_PLAYER || "ffplay",
+    });
+    return state.playback;
+  }
+
+  function showDisclosure(ctx: ExtensionContext) {
+    if (state.disclosureShown) return;
+
+    if (ctx.hasUI) ctx.ui.notify(AI_VOICE_DISCLOSURE, "info");
+    else process.stderr.write(`[pi-talk] ${AI_VOICE_DISCLOSURE}\n`);
+    state.disclosureShown = true;
+  }
+
   function updateStatus() {
     const ctx = state.activeContext;
     if (!ctx?.hasUI) return;
@@ -88,7 +113,8 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       label = `talking (${state.queue.length} queued)`;
     }
 
-    ctx.ui.setStatus(STATUS_ID, `${label} · ${formatPlaybackSpeed(state.playbackSpeed)}`);
+    const provider = state.mode === "gagged" ? "" : "AI voice · OpenAI · ";
+    ctx.ui.setStatus(STATUS_ID, `${provider}${label} · ${formatPlaybackSpeed(state.playbackSpeed)}`);
   }
 
   async function openPlaybackSpeedControl(ctx: ExtensionContext) {
@@ -133,11 +159,11 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
           else if (matchesKey(data, Key.space)) {
             if (state.mode === "talking") {
               state.mode = "paused";
-              state.currentPlayer?.kill("SIGSTOP");
+              state.playback?.pause();
               notify(ctx, "Speech paused at the current position");
             } else if (state.mode === "paused") {
               state.mode = "talking";
-              state.currentPlayer?.kill("SIGCONT");
+              state.playback?.resume();
               notify(ctx, "Speech continued from the paused position");
               void drainQueue();
             } else {
@@ -206,12 +232,8 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
   }
 
   function cleanForSpeech(text: string): string {
-    return text
-      .replace(/\$\$[\s\S]*?\$\$/g, " ")
-      .replace(/\\\[[\s\S]*?\\\]/g, " ")
+    return stripDelimitedMath(text)
       .replace(/\\begin\{([^}]+)}[\s\S]*?\\end\{\1}/g, " ")
-      .replace(/\\\([\s\S]*?\\\)/g, " ")
-      .replace(/\$[\s\S]*?\$/g, " ")
       .replace(/\[([^\]]+)]\([^)]*\)/g, "$1")
       .replace(/(`+)([^`\n]+)\1/g, "$2")
       .replace(/https?:\/\/\S+/g, "")
@@ -232,7 +254,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
   function enqueueSpeech(text: string) {
     if (!text || state.mode === "gagged") return;
 
-    state.queue.push(text);
+    state.queue.push(...splitSpeechText(text));
     updateStatus();
     if (state.mode === "talking") void drainQueue();
   }
@@ -251,82 +273,24 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     resetAccumulator();
   }
 
-  function stopPlayback(clearQueue = true) {
+  async function stopPlayback(clearQueue = true) {
     state.generation += 1;
-    state.currentController?.abort();
-    state.currentController = undefined;
-
-    if (state.currentPlayer) {
-      // A paused child has already received SIGSTOP, which makes ChildProcess.killed
-      // unreliable as an indication that the process has exited.
-      state.currentPlayer.kill("SIGCONT");
-      state.currentPlayer.kill("SIGTERM");
-    }
-    state.currentPlayer = undefined;
-
     if (clearQueue) state.queue = [];
     state.processing = false;
     updateStatus();
-  }
-
-  async function playWithOpenAI(text: string, generation: number, playbackSpeed: number) {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
-
-    const controller = new AbortController();
-    state.currentController = controller;
-
-    const response = await fetch(OPENAI_SPEECH_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: process.env.PI_SPEAK_MODEL || "gpt-4o-mini-tts",
-        voice: process.env.PI_SPEAK_VOICE || "marin",
-        input: text,
-        response_format: "wav",
-      }),
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      const detail = (await response.text()).slice(0, 500);
-      throw new Error(`OpenAI speech failed (${response.status}): ${detail}`);
-    }
-    if (!response.body) throw new Error("OpenAI speech returned no audio body");
-    if (generation !== state.generation) return;
-
-    const player = spawn(process.env.PI_SPEAK_PLAYER || "ffplay", [
-      "-nodisp",
-      "-autoexit",
-      "-loglevel",
-      "error",
-      "-af",
-      atempoFilter(playbackSpeed),
-      "-i",
-      "pipe:0",
-    ]);
-    state.currentPlayer = player;
-    if (state.mode === "paused") player.kill("SIGSTOP");
-
-    let stderr = "";
-    player.stderr.on("data", (chunk) => {
-      if (stderr.length < 500) stderr += String(chunk);
-    });
-
-    const closed = once(player, "close") as Promise<[number | null, NodeJS.Signals | null]>;
-    await pipeline(Readable.fromWeb(response.body as never), player.stdin);
-    const [code] = await closed;
-
-    if (generation === state.generation && code !== 0) {
-      throw new Error(`ffplay exited with ${code}: ${stderr.trim() || "unknown playback error"}`);
-    }
+    await state.playback?.cancel();
   }
 
   async function drainQueue() {
     if (state.processing || state.mode !== "talking") return;
+    const playback = ensurePlayback();
+    if (!playback) {
+      state.queue = [];
+      notify(state.activeContext, "Speech unavailable: OPENAI_API_KEY is not set.", "error");
+      updateStatus();
+      return;
+    }
+
     state.processing = true;
     updateStatus();
 
@@ -337,16 +301,14 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
         if (!text) continue;
 
         try {
-          await playWithOpenAI(text, generation, state.playbackSpeed);
+          await playback.playChunk(text, state.playbackSpeed);
         } catch (error) {
-          if (generation !== state.generation || (error instanceof Error && error.name === "AbortError")) break;
-          notify(state.activeContext, error instanceof Error ? error.message : String(error), "error");
+          if (generation !== state.generation || error instanceof SpeechCancelledError) break;
+          state.queue = [];
+          notifySpeechError(error);
+          break;
         } finally {
-          if (generation === state.generation) {
-            state.currentController = undefined;
-            state.currentPlayer = undefined;
-            updateStatus();
-          }
+          if (generation === state.generation) updateStatus();
         }
       }
     } finally {
@@ -377,15 +339,29 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     });
   }
 
-  function startTalking(ctx: ExtensionContext, utterances: string[], message: string): boolean {
-    if (!process.env.OPENAI_API_KEY) {
-      notify(ctx, "OPENAI_API_KEY is not set", "error");
+  async function startTalking(ctx: ExtensionContext, utterances: string[], message: string): Promise<boolean> {
+    const playback = ensurePlayback();
+    if (!playback) {
+      state.mode = "gagged";
+      notify(ctx, "Speech unavailable: OPENAI_API_KEY is not set.", "error");
+      updateStatus();
       return false;
     }
 
-    stopPlayback();
+    try {
+      await stopPlayback();
+    } catch (error) {
+      state.mode = "gagged";
+      notifySpeechError(error);
+      updateStatus();
+      return false;
+    }
+
+    showDisclosure(ctx);
+    playback.resume();
     state.mode = "talking";
-    state.queue.push(...utterances);
+    const text = utterances.join(" ").trim();
+    if (text) state.queue.push(...splitSpeechText(text));
     notify(ctx, message);
     updateStatus();
     void drainQueue();
@@ -399,12 +375,16 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       : state.currentMessageComplete
         ? "newest message complete"
         : "no current complete message";
-    return `${state.mode}; ${activity}; ${state.queue.length} queued; ${message}; speed ${formatPlaybackSpeed(state.playbackSpeed)}; voice ${process.env.PI_SPEAK_VOICE || "marin"}`;
+    return `${state.mode}; ${activity}; ${state.queue.length} queued; ${message}; speed ${formatPlaybackSpeed(state.playbackSpeed)}; model ${OPENAI_SPEECH_MODEL}; voice ${OPENAI_SPEECH_VOICE}`;
   }
 
   pi.on("session_start", async (_event, ctx) => {
     state.activeContext = ctx;
     state.mode = "gagged";
+    state.processing = false;
+    state.queue = [];
+    state.playback = undefined;
+    state.disclosureShown = false;
     state.currentMessageStreaming = false;
     state.currentMessageComplete = false;
     state.latestCompleteUtterances = [];
@@ -421,7 +401,14 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
   pi.on("message_start", async (event) => {
     if (event.message.role !== "assistant") return;
 
-    if (state.mode === "talking") stopPlayback();
+    if (state.mode === "talking") {
+      try {
+        await stopPlayback();
+      } catch (error) {
+        state.mode = "gagged";
+        notifySpeechError(error);
+      }
+    }
     resetAccumulator();
     state.currentUtterances = [];
     state.committedUtteranceCount = 0;
@@ -468,9 +455,14 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     state.mode = "gagged";
-    stopPlayback();
+    try {
+      await stopPlayback();
+    } catch (error) {
+      notifySpeechError(error);
+    }
     resetAccumulator();
     if (ctx.hasUI) ctx.ui.setStatus(STATUS_ID, undefined);
+    state.playback = undefined;
     state.activeContext = undefined;
   });
 
@@ -482,7 +474,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       if (command === "status") {
         notify(ctx, describeState());
       } else if (command === "test") {
-        startTalking(ctx, ["Pi Talk is ready."], "Talking; playing the audio test");
+        await startTalking(ctx, ["Pi Talk is ready."], "Talking; playing the audio test");
       } else if (command) {
         notify(ctx, "Usage: /talk [test|status]", "warning");
       } else {
@@ -492,7 +484,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
             ? state.currentUtterances
             : state.latestCompleteUtterances;
         const newest = newestUtterances.join(" ");
-        startTalking(
+        await startTalking(
           ctx,
           newest ? [newest] : [],
           newest
@@ -512,7 +504,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
         notify(ctx, "Speech is already paused");
       } else {
         state.mode = "paused";
-        state.currentPlayer?.kill("SIGSTOP");
+        state.playback?.pause();
         notify(ctx, "Speech paused at the current position");
       }
       updateStatus();
@@ -526,7 +518,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
         notify(ctx, "Speech is not paused", "warning");
       } else {
         state.mode = "talking";
-        state.currentPlayer?.kill("SIGCONT");
+        state.playback?.resume();
         notify(ctx, "Speech continued from the paused position");
         void drainQueue();
       }
@@ -570,8 +562,12 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     description: "Stop speech, clear its queue, and disable automatic speaking",
     handler: async (_args, ctx) => {
       state.mode = "gagged";
-      stopPlayback();
-      notify(ctx, "Pi Talk gagged");
+      try {
+        await stopPlayback();
+        notify(ctx, "Pi Talk gagged");
+      } catch (error) {
+        notifySpeechError(error);
+      }
       updateStatus();
     },
   });

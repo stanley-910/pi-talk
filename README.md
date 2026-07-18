@@ -1,53 +1,58 @@
 # Pi Talk
 
-> **PROTOTYPE — throw this away or absorb the result into a real Pi package.**
+Pi Talk is a macOS Pi extension that reads completed assistant responses aloud through OpenAI text-to-speech while preserving explicit local playback control.
 
-## Question this prototype answers
+It starts **Gagged**. Speech begins only after `/talk`, and the first activation in every session displays the required AI-voice and OpenAI data-retention disclosure before audio starts.
 
-Can a Pi extension read streamed assistant prose and structured grilling questions through OpenAI without blocking the TUI, repeating the final response, reading fenced code, or leaving audio playback behind?
+## Speech contract
 
-The prototype buffers each complete assistant response, removes fenced code and common delimited LaTeX, sends the remaining body to `gpt-4o-mini-tts` in one request, and pipes the streamed WAV response into `ffplay`. It separately watches question-tool execution so tool-only questions are spoken too.
+Pi Talk:
 
-## Scope
+- waits for a complete assistant response before sending speech text;
+- removes fenced code, common delimited LaTeX, raw URLs, and basic Markdown syntax;
+- speaks assistant prose, inline-code text, and structured question/option labels;
+- splits only long cleaned messages into ordered semantic chunks capped at 1,800 UTF-8 bytes;
+- sends one chunk at a time to `POST /v1/audio/speech` using pinned `gpt-4o-mini-tts-2025-12-15`, voice `marin`, streamed WAV, and API speed `1.0`;
+- pipes response bytes with backpressure into one sequential `ffplay -f wav` process;
+- uses local `ffplay` tempo filtering for user speed control;
+- performs no prefetch and no automatic request retry;
+- discards the rest of a message after any current-chunk failure;
+- lets the newest turn win while Talking, with bounded HTTP/body/player teardown before replacement playback.
 
-Included:
+The HTTP lifecycle uses a 15-second response-header deadline, a 10-second response-body idle deadline, and a 120-second total chunk deadline. Cancellation aborts the request and response reader, closes player stdin, resumes a paused child, sends `SIGTERM`, escalates to `SIGKILL`, and waits for process close. Expected supersession errors remain silent.
 
-- Pi only
-- OpenAI `gpt-4o-mini-tts`
-- One TTS request per complete assistant response
-- Structured `ask_user_question` question and option labels
-- Fenced-code suppression and best-effort common LaTeX filtering
-- Spoken inline code with backtick delimiters removed
-- Basic Markdown cleanup
-- Explicit Gagged, Talking, and Paused playback states
-- `/talk`, `/pause`, `/unpause`, and `/gag` controls
-- `/speed` keyboard slider and direct speed setting
-- `ffplay` `atempo` playback from `0.50×` to `3.00×`
-- macOS playback through `ffplay`
+## Privacy and disclosure
 
-Not included:
+Before first playback each session, Pi Talk states:
 
-- Claude Code
-- Multiple providers
-- Persistence
-- Polished configuration UI
-- Reading thinking, tool output, option descriptions, or fenced code
+> **AI voice:** Pi Talk sends cleaned assistant text to OpenAI to generate speech. OpenAI may retain API content for up to 30 days for abuse monitoring unless your organization has approved data-retention controls. Audio is streamed to a local player and is not saved by Pi Talk.
+
+While active, the footer includes `AI voice · OpenAI`. Pi Talk does not intentionally log or persist:
+
+- API keys or authorization headers;
+- original or cleaned spoken text;
+- response audio bytes;
+- raw OpenAI error bodies;
+- environment dumps.
+
+Provider and playback failures use sanitized notifications. OpenAI-side work or billing after client cancellation is not guaranteed to stop immediately, so Pi Talk does not prefetch future chunks.
 
 ## Requirements
 
 - Pi
 - Node.js 22+
+- macOS
 - `ffplay` on `PATH` (provided by FFmpeg)
 - `OPENAI_API_KEY` in the environment
 
 Optional environment variables:
 
 ```sh
-export PI_SPEAK_VOICE=marin
-export PI_SPEAK_MODEL=gpt-4o-mini-tts
 export PI_SPEAK_PLAYER=ffplay
 export PI_TALK_SPEED=1.25
 ```
+
+The model and voice are intentionally pinned contract values, not environment overrides.
 
 ## Run
 
@@ -57,16 +62,16 @@ From this project:
 npm start
 ```
 
-Pi Talk starts **Gagged**. To activate it and confirm OpenAI plus `ffplay` work, run:
-
-```text
-/talk test
-```
-
-To load the prototype while working in another repository:
+To load the extension while working in another repository:
 
 ```sh
 pi -e ~/Developer/pi-talk/src/index.ts
+```
+
+To run deterministic, non-billable tests:
+
+```sh
+npm test
 ```
 
 ## Controls
@@ -77,30 +82,50 @@ pi -e ~/Developer/pi-talk/src/index.ts
 /unpause       Continue from the exact paused position
 /gag           Stop audio, clear queued speech, and disable auto-speaking
 /speed         Open the keyboard playback-speed slider
-/speed 1.25    Set playback speed directly for the next utterance
+/speed 1.25    Set playback speed directly for the next chunk
 /speed reset   Restore 1.25× playback
-/talk test     Activate Talking and play a short diagnostic
-/talk status   Show the full prototype state, including speed
+/talk test     Activate Talking and play a short live OpenAI diagnostic
+/talk status   Show playback, queue, model, voice, and speed state
 ```
 
-A newer assistant message interrupts stale audio while Talking. Pi Talk waits for that message to finish, then speaks it in one request for natural continuity. While Paused, the exact position and queued backlog are preserved for `/unpause`; `/talk` instead discards that stale backlog and starts the newest complete message from its beginning.
+A newer assistant message interrupts stale audio while Talking. Pi Talk waits for the new message to finish, then speaks it. While Paused, automatic `message_start` preserves the exact position and backlog; `/talk` explicitly discards stale paused audio and starts the newest complete message from its beginning.
 
-The `/speed` slider uses `j` to speed up and `k` to slow down by `0.10×`. `Shift+j`/`Shift+k` change in the same directions by `0.05×`; `←`/`→` remain optional coarse controls. Space pauses or unpauses playback without closing the menu. `r` resets, Enter applies, and Escape or Ctrl+C cancels. A changed speed applies to the next utterance; active audio keeps its current rate. Rates above `2.00×` use chained `atempo` filters to avoid FFmpeg sample skipping. Slider changes are in-memory only, while a valid `PI_TALK_SPEED` sets the startup default; invalid or out-of-range values fall back to `1.25×`.
+The `/speed` slider uses `j`/`k` for `0.10×` changes, shifted `j`/`k` for `0.05×`, arrows for optional coarse control, Space to pause/unpause, `r` to reset, Enter to apply, and Escape or Ctrl+C to cancel. Supported speed is `0.50×–3.00×`; changes apply to the next chunk. Rates above `2.00×` use chained `atempo` filters.
 
-Semantic 2–3 sentence chunks with one-ahead prefetch remain a possible follow-up if waiting for message completion feels too slow.
+## Manual live test checklist
 
-## What to try
+Live tests call OpenAI and incur API cost. Run them only when intended.
 
-1. `/talk test` — confirm OpenAI and `ffplay` work.
-2. `/gag`, ask for a response, then `/talk` — hear the newest response from its beginning.
-3. Ask Pi for a long prose explanation — speech should begin after the message completes and flow continuously.
-4. Invoke a skill that asks a structured question — hear the question and concise option labels.
-5. Ask for fenced code and inline code — speak prose and inline code, but skip fences. Common LaTeX filtering is best effort.
-6. `/pause` during a long sentence, then `/unpause` — continue from the exact position.
-7. Pause old audio, produce a newer response, then `/talk` — discard the backlog and start the newer response from its beginning.
-8. Open `/speed`, use `j` and `k`, set `1.50×`, and confirm the next response is faster without a pitch shift.
-9. Set `3.00×` and confirm chained tempo filters remain intelligible without pitch shift.
-10. Change speed during playback and confirm only the following utterance uses the new rate.
-11. `/gag` or exit Pi during playback — audio should stop immediately.
+1. Start Pi Talk and confirm it reports **Gagged**.
+2. Run `/talk test`; confirm the disclosure appears before audio and the footer shows `AI voice · OpenAI`.
+3. Ask for a normal prose response; confirm speech starts only after message completion and sounds continuous.
+4. Ask for a response longer than 1,800 UTF-8 bytes; confirm all chunks play once, in order, with no overlap.
+5. Ask for fenced and inline code; confirm prose and inline-code text are spoken while the fence is silent.
+6. Trigger a structured question; confirm the question and option labels are spoken once without descriptions.
+7. During long playback, run `/pause`, then `/unpause`; confirm exact-position continuation.
+8. While Talking, submit a newer turn; confirm stale audio stops promptly and no old audio resumes.
+9. Pause old audio, produce a newer response, then run `/talk`; confirm the paused player is discarded before new playback.
+10. Change `/speed` during playback; confirm only the next chunk uses the new speed.
+11. Run `/gag` during playback; confirm audio stops, queued chunks are discarded, and later messages remain silent.
+12. Exit or reload Pi during playback; confirm no `ffplay` process remains.
+13. Temporarily use an invalid API key; confirm the UI shows a sanitized authentication error without provider body text.
+14. After cancellation/error testing, run `pgrep -fl ffplay`; confirm Pi Talk left no child process.
 
-Record what feels wrong in [NOTES.md](NOTES.md). The prototype is successful when it reveals the desired queueing, interruption, and question-reading behavior—not when the code looks production-ready.
+## Automated coverage
+
+`npm test` uses fake HTTP streams and fake player processes. It verifies:
+
+- Unicode-safe semantic chunk bounds and ordering;
+- the exact pinned OpenAI request body and forced-WAV player arguments;
+- incremental response streaming and backpressure handling;
+- cancellation before headers and during playback;
+- bounded cancellation when response-stream cleanup never settles;
+- paused-child resume-before-termination;
+- process/stdin failures and `SIGTERM` to `SIGKILL` escalation;
+- header, body-idle, and total deadlines;
+- failed-cleanup poisoning that blocks unsafe replacement playback;
+- no retry and sanitized provider failures;
+- rejection of overlapping playback;
+- LaTeX removal without swallowing ordinary currency prose.
+
+See [`NOTES.md`](NOTES.md) for the earlier live prototype observations that led to this contract.
