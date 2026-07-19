@@ -13,13 +13,13 @@ Pi Talk:
 - speaks assistant prose, inline-code text, and structured question/option labels;
 - splits only long cleaned messages into ordered semantic chunks capped at 1,800 UTF-8 bytes;
 - sends one chunk at a time to `POST /v1/audio/speech` using pinned `gpt-4o-mini-tts-2025-12-15`, voice `marin`, streamed WAV, and API speed `1.0`;
-- pipes response bytes with backpressure into one sequential `ffplay -f wav` process;
-- uses local `ffplay` tempo filtering for user speed control;
+- pipes response bytes with backpressure into one sequential `mpv` process forced to WAV input;
+- uses mpv playback speed and JSON IPC for exact-position pause/resume;
 - performs no prefetch and no automatic request retry;
 - discards the rest of a message after any current-chunk failure;
 - lets the newest turn win while Talking, with bounded HTTP/body/player teardown before replacement playback.
 
-The HTTP lifecycle uses a 15-second response-header deadline, a 10-second response-body idle deadline, and a 120-second total chunk deadline. Cancellation aborts the request and response reader, closes player stdin, resumes a paused child, sends `SIGTERM`, escalates to `SIGKILL`, and waits for process close. Expected supersession errors remain silent.
+The HTTP lifecycle uses a 15-second response-header deadline, a 10-second response-body idle deadline, and a 120-second total chunk deadline. Cancellation aborts the request and response reader, closes player stdin and IPC, sends `SIGTERM`, escalates to `SIGKILL`, and waits for process close. Expected supersession errors remain silent.
 
 ## Privacy and disclosure
 
@@ -42,17 +42,17 @@ Provider and playback failures use sanitized notifications. OpenAI-side work or 
 - Pi
 - Node.js 22+
 - macOS
-- `ffplay` on `PATH` (provided by FFmpeg)
+- `mpv` on `PATH` (`brew install mpv`)
 - `OPENAI_API_KEY` in the environment
 
 Optional environment variables:
 
 ```sh
-export PI_SPEAK_PLAYER=ffplay
+export PI_SPEAK_PLAYER=mpv
 export PI_TALK_SPEED=1.25
 ```
 
-The model and voice are intentionally pinned contract values, not environment overrides.
+`PI_SPEAK_PLAYER` may select another mpv-compatible executable path; arbitrary player CLIs are not compatible. The model and voice are intentionally pinned contract values, not environment overrides.
 
 ## Run
 
@@ -90,7 +90,7 @@ npm test
 
 A newer assistant message interrupts stale audio while Talking. Pi Talk waits for the new message to finish, then speaks it. While Paused, automatic `message_start` preserves the exact position and backlog; `/talk` explicitly discards stale paused audio and starts the newest complete message from its beginning.
 
-The `/speed` slider uses `j`/`k` for `0.10×` changes, shifted `j`/`k` for `0.05×`, arrows for optional coarse control, Space to pause/unpause, `r` to reset, Enter to apply, and Escape or Ctrl+C to cancel. Supported speed is `0.50×–3.00×`; changes apply to the next chunk. Rates above `2.00×` use chained `atempo` filters.
+The `/speed` slider uses `j`/`k` for `0.10×` changes, shifted `j`/`k` for `0.05×`, arrows for optional coarse control, Space to pause/unpause, `r` to reset, Enter to apply, and Escape or Ctrl+C to cancel. Supported speed is `0.50×–3.00×`; changes apply to the next chunk through mpv's pitch-corrected playback speed.
 
 ## Manual live test checklist
 
@@ -107,20 +107,20 @@ Live tests call OpenAI and incur API cost. Run them only when intended.
 9. Pause old audio, produce a newer response, then run `/talk`; confirm the paused player is discarded before new playback.
 10. Change `/speed` during playback; confirm only the next chunk uses the new speed.
 11. Run `/gag` during playback; confirm audio stops, queued chunks are discarded, and later messages remain silent.
-12. Exit or reload Pi during playback; confirm no `ffplay` process remains.
+12. Exit or reload Pi during playback; confirm no Pi Talk `mpv` process remains.
 13. Temporarily use an invalid API key; confirm the UI shows a sanitized authentication error without provider body text.
-14. After cancellation/error testing, run `pgrep -fl ffplay`; confirm Pi Talk left no child process.
+14. After cancellation/error testing, run `pgrep -fl mpv`; confirm Pi Talk left no child process.
 
 ## Automated coverage
 
 `npm test` uses fake HTTP streams and fake player processes. It verifies:
 
 - Unicode-safe semantic chunk bounds and ordering;
-- the exact pinned OpenAI request body and forced-WAV player arguments;
+- the exact pinned OpenAI request body and forced-WAV mpv arguments;
 - incremental response streaming and backpressure handling;
 - cancellation before headers and during playback;
 - bounded cancellation when response-stream cleanup never settles;
-- paused-child resume-before-termination;
+- mpv JSON IPC pause/resume without process suspension, including bounded control-failure teardown;
 - process/stdin failures and `SIGTERM` to `SIGKILL` escalation;
 - header, body-idle, and total deadlines;
 - failed-cleanup poisoning that blocks unsafe replacement playback;

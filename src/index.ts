@@ -91,7 +91,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
 
     state.playback ??= new OpenAISpeechPlayback({
       apiKey,
-      playerCommand: process.env.PI_SPEAK_PLAYER || "ffplay",
+      playerCommand: process.env.PI_SPEAK_PLAYER || "mpv",
     });
     return state.playback;
   }
@@ -157,20 +157,9 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
           else if (matchesKey(data, Key.left) || data === "[") adjust(-COARSE_SPEED_STEP);
           else if (matchesKey(data, Key.right) || data === "]") adjust(COARSE_SPEED_STEP);
           else if (matchesKey(data, Key.space)) {
-            if (state.mode === "talking") {
-              state.mode = "paused";
-              state.playback?.pause();
-              notify(ctx, "Speech paused at the current position");
-            } else if (state.mode === "paused") {
-              state.mode = "talking";
-              state.playback?.resume();
-              notify(ctx, "Speech continued from the paused position");
-              void drainQueue();
-            } else {
-              notify(ctx, "Pi Talk is gagged; use /talk first", "warning");
-            }
-            updateStatus();
-            tui.requestRender();
+            if (state.mode === "talking") void setSpeechPaused(ctx, true).finally(() => tui.requestRender());
+            else if (state.mode === "paused") void setSpeechPaused(ctx, false).finally(() => tui.requestRender());
+            else notify(ctx, "Pi Talk is gagged; use /talk first", "warning");
           } else if (matchesKey(data, Key.home)) {
             draft = MIN_PLAYBACK_SPEED;
             tui.requestRender();
@@ -281,6 +270,27 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     await state.playback?.cancel();
   }
 
+  async function setSpeechPaused(ctx: ExtensionContext, paused: boolean): Promise<boolean> {
+    const previousMode = state.mode;
+    const targetMode: SpeechMode = paused ? "paused" : "talking";
+    state.mode = targetMode;
+    updateStatus();
+
+    try {
+      if (paused) await state.playback?.pause();
+      else await state.playback?.resume();
+    } catch {
+      if (state.mode === targetMode) state.mode = previousMode;
+      updateStatus();
+      return false;
+    }
+
+    if (state.mode !== targetMode) return false;
+    notify(ctx, paused ? "Speech paused at the current position" : "Speech continued from the paused position");
+    if (!paused) void drainQueue();
+    return true;
+  }
+
   async function drainQueue() {
     if (state.processing || state.mode !== "talking") return;
     const playback = ensurePlayback();
@@ -358,7 +368,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     }
 
     showDisclosure(ctx);
-    playback.resume();
+    await playback.resume();
     state.mode = "talking";
     const text = utterances.join(" ").trim();
     if (text) state.queue.push(...splitSpeechText(text));
@@ -503,9 +513,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       } else if (state.mode === "paused") {
         notify(ctx, "Speech is already paused");
       } else {
-        state.mode = "paused";
-        state.playback?.pause();
-        notify(ctx, "Speech paused at the current position");
+        await setSpeechPaused(ctx, true);
       }
       updateStatus();
     },
@@ -517,10 +525,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       if (state.mode !== "paused") {
         notify(ctx, "Speech is not paused", "warning");
       } else {
-        state.mode = "talking";
-        state.playback?.resume();
-        notify(ctx, "Speech continued from the paused position");
-        void drainQueue();
+        await setSpeechPaused(ctx, false);
       }
       updateStatus();
     },

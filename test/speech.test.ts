@@ -22,13 +22,17 @@ type FakePlayerBehavior = {
   forceBackpressureOnce?: boolean;
   emitStdinErrorOnce?: boolean;
   errorOnTerm?: boolean;
+  ipcErrorOnce?: boolean;
+  ignoreIpc?: boolean;
 };
 
 class FakePlayer extends EventEmitter implements PlayerProcess {
   readonly stdin: PassThrough;
   readonly stderr = new PassThrough();
+  readonly control = new PassThrough();
   readonly signals: NodeJS.Signals[] = [];
   readonly audio: Buffer[] = [];
+  readonly commands: unknown[][] = [];
   pid: number | undefined = 1;
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
@@ -64,6 +68,27 @@ class FakePlayer extends EventEmitter implements PlayerProcess {
     this.stdin.on("finish", () => {
       if (this.behavior.closeOnInputEnd !== false) this.close(0, null);
     });
+
+    let ipcError = behavior.ipcErrorOnce === true;
+    this.control.write = ((chunk: string | Uint8Array) => {
+      const message = JSON.parse(String(chunk));
+      this.commands.push(message.command);
+      if (!this.behavior.ignoreIpc) {
+        queueMicrotask(() => {
+          this.control.emit(
+            "data",
+            Buffer.from(
+              `${JSON.stringify({
+                request_id: message.request_id,
+                error: ipcError ? "property unavailable" : "success",
+              })}\n`,
+            ),
+          );
+          ipcError = false;
+        });
+      }
+      return true;
+    }) as PassThrough["write"];
   }
 
   kill(signal: NodeJS.Signals = "SIGTERM"): boolean {
@@ -104,6 +129,7 @@ function playbackWith(
   timeoutOverrides: Partial<{
     headerMs: number;
     bodyIdleMs: number;
+    controlMs: number;
     totalMs: number;
     termGraceMs: number;
     killGraceMs: number;
@@ -156,9 +182,10 @@ test("stripDelimitedMath removes math without swallowing currency prose", () => 
   assert.equal(stripDelimitedMath("Before $$x + y$$ after."), "Before   after.");
 });
 
-test("playChunk sends the pinned request and streams WAV bytes to ffplay", async () => {
+test("playChunk sends the pinned request and streams WAV bytes to mpv", async () => {
   const players: FakePlayer[] = [];
   let request: { url: string; init: RequestInit } | undefined;
+  let spawnedCommand: string | undefined;
   let spawnedArgs: string[] | undefined;
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -175,7 +202,8 @@ test("playChunk sends the pinned request and streams WAV bytes to ffplay", async
       request = { url: String(url), init: init ?? {} };
       return new Response(body, { status: 200 });
     },
-    spawnPlayer: (_command, args) => {
+    spawnPlayer: (command, args) => {
+      spawnedCommand = command;
       spawnedArgs = args;
       const player = new FakePlayer();
       players.push(player);
@@ -197,18 +225,18 @@ test("playChunk sends the pinned request and streams WAV bytes to ffplay", async
     speed: 1,
   });
   assert.equal(new Headers(request?.init.headers).get("authorization"), "Bearer test-key");
+  assert.equal(spawnedCommand, "mpv");
   assert.deepEqual(spawnedArgs, [
-    "-nodisp",
-    "-autoexit",
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-f",
-    "wav",
-    "-af",
-    "atempo=1.25",
-    "-i",
-    "pipe:0",
+    "--no-config",
+    "--no-video",
+    "--no-terminal",
+    "--msg-level=all=error",
+    "--input-ipc-client=fd://3",
+    "--audio-pitch-correction=yes",
+    "--speed=1.25",
+    "--demuxer-lavf-format=wav",
+    "--pause=no",
+    "-",
   ]);
   assert.deepEqual(Buffer.concat(players[0].audio), Buffer.from([1, 2, 3, 4]));
   assert.equal(playback.hasActivePlayback, false);
@@ -254,7 +282,7 @@ test("an asynchronous player stdin error becomes a sanitized playback failure", 
     playback.playChunk("hello", 1),
     (error) => error instanceof SpeechError && error.code === "playback" && !error.message.includes("broken pipe"),
   );
-  assert.deepEqual(players[0].signals, ["SIGCONT", "SIGTERM"]);
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
 });
 
 test("a player spawn error is actionable and does not wait for close", async () => {
@@ -330,7 +358,7 @@ test("cancel closes stdin and terminates a playing child before returning", asyn
   await assert.rejects(pending, SpeechCancelledError);
   assert.equal(bodyCancelled, true);
   assert.equal(players[0].stdin.destroyed, true);
-  assert.deepEqual(players[0].signals, ["SIGCONT", "SIGTERM"]);
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
 });
 
 test("cancel does not wait for a non-settling response-stream cancellation", async () => {
@@ -356,10 +384,10 @@ test("cancel does not wait for a non-settling response-stream cancellation", asy
 
   await assert.rejects(pending, SpeechCancelledError);
   assert.equal(cancellationStarted, true);
-  assert.deepEqual(players[0].signals, ["SIGCONT", "SIGTERM"]);
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
 });
 
-test("cancel resumes a paused child before terminating it", async () => {
+test("pause and resume use mpv IPC without suspending the player process", async () => {
   const players: FakePlayer[] = [];
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -370,11 +398,87 @@ test("cancel resumes a paused child before terminating it", async () => {
 
   const pending = playback.playChunk("hello", 1);
   await waitFor(() => players.length === 1);
-  playback.pause();
+  await playback.pause();
+  await playback.resume();
+
+  assert.deepEqual(players[0].commands, [
+    ["set_property", "pause", true],
+    ["set_property", "pause", false],
+  ]);
+  assert.deepEqual(players[0].signals, []);
+
+  await playback.cancel();
+  await assert.rejects(pending, SpeechCancelledError);
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
+});
+
+test("mpv control failures are sanitized and stop playback safely", async () => {
+  const players: FakePlayer[] = [];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1]));
+    },
+  });
+  const playback = playbackWith(async () => new Response(body), players, { ipcErrorOnce: true });
+
+  const pending = playback.playChunk("hello", 1);
+  void pending.catch(() => undefined);
+  await waitFor(() => players.length === 1);
+  await assert.rejects(
+    playback.pause(),
+    (error) =>
+      error instanceof SpeechError && error.code === "playback" && !error.message.includes("property unavailable"),
+  );
+  await assert.rejects(pending, (error) => error instanceof SpeechError && error.code === "playback");
+  assert.equal(players[0].control.destroyed, true);
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
+});
+
+test("mpv control timeout is sanitized and stops playback safely", async () => {
+  const players: FakePlayer[] = [];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1]));
+    },
+  });
+  const playback = playbackWith(
+    async () => new Response(body),
+    players,
+    { ignoreIpc: true },
+    { controlMs: 5 },
+  );
+
+  const pending = playback.playChunk("hello", 1);
+  void pending.catch(() => undefined);
+  await waitFor(() => players.length === 1);
+  await assert.rejects(
+    playback.pause(),
+    (error) => error instanceof SpeechError && error.code === "playback" && !error.message.includes("timed out"),
+  );
+  await assert.rejects(pending, (error) => error instanceof SpeechError && error.code === "playback");
+  assert.equal(players[0].control.destroyed, true);
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
+});
+
+test("cancellation silently interrupts a pending mpv control command", async () => {
+  const players: FakePlayer[] = [];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1]));
+    },
+  });
+  const playback = playbackWith(async () => new Response(body), players, { ignoreIpc: true });
+
+  const pending = playback.playChunk("hello", 1);
+  await waitFor(() => players.length === 1);
+  const pausing = playback.pause();
+  void pausing.catch(() => undefined);
+  await waitFor(() => players[0].commands.length === 1);
   await playback.cancel();
 
+  await assert.rejects(pausing, SpeechCancelledError);
   await assert.rejects(pending, SpeechCancelledError);
-  assert.deepEqual(players[0].signals, ["SIGSTOP", "SIGCONT", "SIGTERM"]);
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
 });
 
 test("cancel escalates to SIGKILL when SIGTERM is ignored", async () => {
@@ -394,7 +498,7 @@ test("cancel escalates to SIGKILL when SIGTERM is ignored", async () => {
   await playback.cancel();
 
   await assert.rejects(pending, SpeechCancelledError);
-  assert.deepEqual(players[0].signals, ["SIGCONT", "SIGTERM", "SIGKILL"]);
+  assert.deepEqual(players[0].signals, ["SIGTERM", "SIGKILL"]);
 });
 
 test("a kill error does not masquerade as process close", async () => {
@@ -413,7 +517,7 @@ test("a kill error does not masquerade as process close", async () => {
   await waitFor(() => players.length === 1);
   await playback.cancel();
   await assert.rejects(pending, SpeechCancelledError);
-  assert.deepEqual(players[0].signals, ["SIGCONT", "SIGTERM", "SIGKILL"]);
+  assert.deepEqual(players[0].signals, ["SIGTERM", "SIGKILL"]);
 });
 
 test("header timeout aborts once and does not retry", async () => {
@@ -452,7 +556,7 @@ test("body idle timeout tears down the player", async () => {
     playback.playChunk("hello", 1),
     (error) => error instanceof SpeechError && error.code === "timeout",
   );
-  assert.deepEqual(players[0].signals, ["SIGCONT", "SIGTERM"]);
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
 });
 
 test("total deadline includes waiting for player close", async () => {
@@ -474,7 +578,7 @@ test("total deadline includes waiting for player close", async () => {
     playback.playChunk("hello", 1),
     (error) => error instanceof SpeechError && error.code === "timeout",
   );
-  assert.deepEqual(players[0].signals, ["SIGCONT", "SIGTERM"]);
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
 });
 
 test("failed SIGKILL cleanup blocks later playback", async () => {
