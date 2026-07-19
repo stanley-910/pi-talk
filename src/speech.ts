@@ -2,7 +2,7 @@ import { once } from "node:events";
 import { spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
 import type { EventEmitter } from "node:events";
-import type { Readable, Writable } from "node:stream";
+import type { Duplex, Readable, Writable } from "node:stream";
 
 export const OPENAI_SPEECH_URL = "https://api.openai.com/v1/audio/speech";
 export const OPENAI_SPEECH_MODEL = "gpt-4o-mini-tts-2025-12-15";
@@ -12,6 +12,7 @@ export const MAX_SPEECH_CHUNK_BYTES = 1_800;
 const DEFAULT_TIMEOUTS: SpeechTimeouts = {
   headerMs: 15_000,
   bodyIdleMs: 10_000,
+  controlMs: 1_000,
   totalMs: 120_000,
   termGraceMs: 250,
   killGraceMs: 1_000,
@@ -20,6 +21,7 @@ const DEFAULT_TIMEOUTS: SpeechTimeouts = {
 export interface PlayerProcess extends EventEmitter {
   stdin: Writable;
   stderr: Readable;
+  control: Duplex;
   pid?: number;
   exitCode: number | null;
   signalCode: NodeJS.Signals | null;
@@ -28,9 +30,17 @@ export interface PlayerProcess extends EventEmitter {
 
 type SpawnPlayer = (command: string, args: string[]) => PlayerProcess;
 
+function spawnDefaultPlayer(command: string, args: string[]): PlayerProcess {
+  const player = spawn(command, args, { stdio: ["pipe", "ignore", "pipe", "pipe"] });
+  const control = player.stdio[3];
+  if (!player.stdin || !player.stderr || !control) throw new Error("mpv stdio unavailable");
+  return Object.assign(player, { control: control as Duplex }) as PlayerProcess;
+}
+
 type SpeechTimeouts = {
   headerMs: number;
   bodyIdleMs: number;
+  controlMs: number;
   totalMs: number;
   termGraceMs: number;
   killGraceMs: number;
@@ -97,6 +107,7 @@ type ActivePlayback = {
   responseBody?: ReadableStream<Uint8Array>;
   reader?: ReadableStreamDefaultReader<Uint8Array>;
   player?: PlayerProcess;
+  playerControl?: MpvIpcClient;
   playerClosed?: Promise<PlayerOutcome>;
   playerOutcome?: PlayerOutcome;
   cleanupPromise?: Promise<void>;
@@ -181,13 +192,6 @@ export function splitSpeechText(text: string, maximumBytes = MAX_SPEECH_CHUNK_BY
   return chunks;
 }
 
-function atempoFilter(playbackSpeed: number): string {
-  if (playbackSpeed <= 2) return `atempo=${playbackSpeed.toFixed(2)}`;
-
-  const factor = Math.sqrt(playbackSpeed).toFixed(5);
-  return `atempo=${factor},atempo=${factor}`;
-}
-
 function responseError(response: Response): SpeechError {
   const status = response.status;
   const requestId = response.headers.get("x-request-id") ?? undefined;
@@ -253,6 +257,82 @@ async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Prom
   }
 }
 
+type IpcRequest = {
+  resolve(): void;
+  reject(error: Error): void;
+};
+
+class MpvIpcClient {
+  private readonly stream: Duplex;
+  private readonly pending = new Map<number, IpcRequest>();
+  private buffer = "";
+  private sequence = 0;
+  private failure?: Error;
+
+  constructor(stream: Duplex) {
+    this.stream = stream;
+    stream.on("data", (chunk) => this.handleData(String(chunk)));
+    stream.on("error", () => this.fail(new Error("mpv IPC stream failed")));
+    stream.on("close", () => this.fail(new Error("mpv IPC stream closed")));
+  }
+
+  setPaused(paused: boolean): Promise<void> {
+    if (this.failure) return Promise.reject(this.failure);
+
+    const requestId = ++this.sequence;
+    const response = new Promise<void>((resolve, reject) => {
+      this.pending.set(requestId, { resolve, reject });
+    });
+
+    try {
+      this.stream.write(
+        `${JSON.stringify({ command: ["set_property", "pause", paused], request_id: requestId })}\n`,
+      );
+    } catch {
+      this.fail(new Error("mpv IPC write failed"));
+    }
+
+    return response;
+  }
+
+  destroy(): void {
+    this.fail(new Error("mpv IPC client closed"));
+    this.stream.destroy();
+  }
+
+  private handleData(chunk: string): void {
+    this.buffer += chunk;
+    let newline = this.buffer.indexOf("\n");
+
+    while (newline >= 0) {
+      const line = this.buffer.slice(0, newline);
+      this.buffer = this.buffer.slice(newline + 1);
+      newline = this.buffer.indexOf("\n");
+      if (!line) continue;
+
+      let message: { request_id?: unknown; error?: unknown };
+      try {
+        message = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      if (typeof message.request_id !== "number") continue;
+      const request = this.pending.get(message.request_id);
+      if (!request) continue;
+      this.pending.delete(message.request_id);
+      if (message.error === "success") request.resolve();
+      else request.reject(new Error("mpv IPC pause command failed"));
+    }
+  }
+
+  private fail(error: Error): void {
+    if (!this.failure) this.failure = error;
+    for (const request of this.pending.values()) request.reject(this.failure);
+    this.pending.clear();
+  }
+}
+
 export class OpenAISpeechPlayback {
   private readonly apiKey: string;
   private readonly fetcher: typeof fetch;
@@ -267,8 +347,8 @@ export class OpenAISpeechPlayback {
   constructor(options: OpenAISpeechPlaybackOptions) {
     this.apiKey = options.apiKey;
     this.fetcher = options.fetcher ?? fetch;
-    this.spawnPlayer = options.spawnPlayer ?? ((command, args) => spawn(command, args) as PlayerProcess);
-    this.playerCommand = options.playerCommand ?? "ffplay";
+    this.spawnPlayer = options.spawnPlayer ?? spawnDefaultPlayer;
+    this.playerCommand = options.playerCommand ?? "mpv";
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...options.timeouts };
   }
 
@@ -276,14 +356,12 @@ export class OpenAISpeechPlayback {
     return this.active !== undefined;
   }
 
-  pause(): void {
-    this.paused = true;
-    this.active?.player?.kill("SIGSTOP");
+  pause(): Promise<void> {
+    return this.setPaused(true);
   }
 
-  resume(): void {
-    this.paused = false;
-    this.active?.player?.kill("SIGCONT");
+  resume(): Promise<void> {
+    return this.setPaused(false);
   }
 
   async cancel(): Promise<void> {
@@ -367,27 +445,27 @@ export class OpenAISpeechPlayback {
       let player: PlayerProcess;
       try {
         player = this.spawnPlayer(this.playerCommand, [
-          "-nodisp",
-          "-autoexit",
-          "-hide_banner",
-          "-loglevel",
-          "error",
-          "-f",
-          "wav",
-          "-af",
-          atempoFilter(playbackSpeed),
-          "-i",
-          "pipe:0",
+          "--no-config",
+          "--no-video",
+          "--no-terminal",
+          "--msg-level=all=error",
+          "--input-ipc-client=fd://3",
+          "--audio-pitch-correction=yes",
+          `--speed=${playbackSpeed}`,
+          "--demuxer-lavf-format=wav",
+          `--pause=${this.paused ? "yes" : "no"}`,
+          "-",
         ]);
       } catch {
         throw new SpeechError(
           "player_unavailable",
-          "Speech unavailable: install FFmpeg or configure PI_SPEAK_PLAYER.",
+          "Speech unavailable: install mpv or configure PI_SPEAK_PLAYER.",
           "Unable to start the speech player",
         );
       }
 
       active.player = player;
+      active.playerControl = new MpvIpcClient(player.control);
       active.playerClosed = playerPromise(player, active);
       active.playerFailure = new Promise<never>((_resolve, reject) => {
         player.on("error", () => {
@@ -396,7 +474,7 @@ export class OpenAISpeechPlayback {
             reject(
               new SpeechError(
                 "player_unavailable",
-                "Speech unavailable: install FFmpeg or configure PI_SPEAK_PLAYER.",
+                "Speech unavailable: install mpv or configure PI_SPEAK_PLAYER.",
                 "Speech player failed to start",
               ),
             );
@@ -416,8 +494,6 @@ export class OpenAISpeechPlayback {
         if (active.stderr.length >= 2_048) return;
         active.stderr = (active.stderr + String(chunk)).slice(0, 2_048);
       });
-      if (this.paused) player.kill("SIGSTOP");
-
       active.reader = response.body.getReader();
       while (true) {
         this.assertCurrent(active);
@@ -477,6 +553,37 @@ export class OpenAISpeechPlayback {
     } finally {
       this.clearDeadlines(active);
       if (this.active === active) this.active = undefined;
+    }
+  }
+
+  private async setPaused(paused: boolean): Promise<void> {
+    const active = this.active;
+    const control = active?.playerControl;
+    if (!control) {
+      this.paused = paused;
+      return;
+    }
+
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        control.setPaused(paused),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("mpv IPC command timed out")), this.timeouts.controlMs);
+        }),
+      ]);
+      this.paused = paused;
+    } catch {
+      if (active.cancelled || this.active !== active) throw new SpeechCancelledError();
+      const failure = new SpeechError(
+        "playback",
+        "Speech playback control failed.",
+        "Speech player pause control failed",
+      );
+      active.interrupt(failure);
+      throw failure;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 
@@ -544,6 +651,7 @@ export class OpenAISpeechPlayback {
 
     active.cleanupPromise = (async () => {
       this.clearDeadlines(active);
+      active.playerControl?.destroy();
       active.player?.stdin.destroy();
       active.controller.abort();
 
@@ -557,7 +665,6 @@ export class OpenAISpeechPlayback {
       const player = active.player;
       if (!player || !active.playerClosed || active.playerOutcome || active.playerSpawnFailed) return;
 
-      player.kill("SIGCONT");
       player.kill("SIGTERM");
       if (await settlesWithin(active.playerClosed, this.timeouts.termGraceMs)) return;
 
