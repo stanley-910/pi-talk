@@ -12,5 +12,8 @@
     "extensions": [
       "./src/index.ts"
     ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-tui": "0.80.7"
   }
 }
