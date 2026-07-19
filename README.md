@@ -27,7 +27,7 @@ Before first playback each session, Pi Talk states:
 
 > **AI voice:** Pi Talk sends cleaned assistant text to OpenAI to generate speech. OpenAI may retain API content for up to 30 days for abuse monitoring unless your organization has approved data-retention controls. Audio is streamed to a local player and is not saved by Pi Talk.
 
-The footer shows the pinned OpenAI model, playback indicator, and speed, for example `gpt-4o-mini-tts-2025-12-15 · ▶ · 1.25×`. Pi Talk does not intentionally log or persist:
+The footer shows the OpenAI model family, playback indicator, and speed, for example `gpt-4o-mini-tts · ▶ · 1.25×`. Pi Talk does not intentionally log or persist:
 
 - API keys or authorization headers;
 - original or cleaned spoken text;

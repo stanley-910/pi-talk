@@ -22,6 +22,7 @@ import {
 } from "./speech.ts";
 
 const STATUS_ID = "pi-talk";
+const STATUS_MODEL = OPENAI_SPEECH_MODEL.replace(/-\d{4}-\d{2}-\d{2}$/, "");
 const AI_VOICE_DISCLOSURE =
   "AI voice: Pi Talk sends cleaned assistant text to OpenAI to generate speech. OpenAI may retain API content for up to 30 days for abuse monitoring unless your organization has approved data-retention controls. Audio is streamed to a local player and is not saved by Pi Talk.";
 
@@ -112,7 +113,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     const indicator = state.mode === "talking" ? "▶" : state.mode === "paused" ? "⏸" : "■";
     ctx.ui.setStatus(
       STATUS_ID,
-      `${OPENAI_SPEECH_MODEL} · ${indicator} · ${formatPlaybackSpeed(state.playbackSpeed)}`,
+      `${STATUS_MODEL} · ${indicator} · ${formatPlaybackSpeed(state.playbackSpeed)}`,
     );
   }
 
