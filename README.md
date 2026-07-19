@@ -62,10 +62,12 @@ From this project:
 npm start
 ```
 
+The development command uses `--no-extensions` so an installed Pi Talk package cannot load alongside the worktree copy and create duplicate commands or competing speech state.
+
 To load the extension while working in another repository:
 
 ```sh
-pi -e ~/Developer/pi-talk/src/index.ts
+pi --no-extensions -e ~/Developer/pi-talk/src/index.ts
 ```
 
 To run deterministic, non-billable tests:
@@ -88,9 +90,21 @@ npm test
 /talk status   Show playback, queue, model, voice, and speed state
 ```
 
+### Direct keyboard shortcuts
+
+Pi Talk requests three native Pi shortcuts:
+
+| Pi shortcut | Gagged | Talking | Paused |
+| --- | --- | --- | --- |
+| `Ctrl+Shift+Space` | Start Talking | Pause | Unpause |
+| `Ctrl+Shift+.` | Increase speed by `0.10×` | Increase speed by `0.10×` | Increase speed by `0.10×` |
+| `Ctrl+Shift+,` | Decrease speed by `0.10×` | Decrease speed by `0.10×` | Decrease speed by `0.10×` |
+
+Speed shortcuts use the same `0.50×–3.00×` bounds as `/speed`. Use `/gag` to stop playback, clear queued speech, and disable automatic speaking. No tmux or Herdr binding is required. After loading or `/reload`, check `/hotkeys` for all three shortcuts; Pi reports shortcut conflicts in its extension diagnostics.
+
 A newer assistant message interrupts stale audio while Talking. Pi Talk waits for the new message to finish, then speaks it. While Paused, automatic `message_start` preserves the exact position and backlog; `/talk` explicitly discards stale paused audio and starts the newest complete message from its beginning.
 
-The `/speed` slider uses `j`/`k` for `0.10×` changes, shifted `j`/`k` for `0.05×`, arrows for optional coarse control, Space to pause/unpause, `r` to reset, Enter to apply, and Escape or Ctrl+C to cancel. Supported speed is `0.50×–3.00×`; changes apply to the next chunk through mpv's pitch-corrected playback speed.
+The `/speed` slider uses `j` to speed up and `k` to slow down by `0.10×`, shifted `j`/`k` for `0.05×`, arrows for optional coarse control, Space to pause/unpause, `r` to reset, Enter to apply, and Escape or Ctrl+C to cancel. Outside the slider, `Ctrl+Shift+.` speeds up and `Ctrl+Shift+,` slows down by `0.10×`. Supported speed is `0.50×–3.00×`; changes apply to the next chunk through mpv's pitch-corrected playback speed, while active audio keeps its current rate.
 
 ## Manual live test checklist
 
@@ -110,6 +124,8 @@ Live tests call OpenAI and incur API cost. Run them only when intended.
 12. Exit or reload Pi during playback; confirm no Pi Talk `mpv` process remains.
 13. Temporarily use an invalid API key; confirm the UI shows a sanitized authentication error without provider body text.
 14. After cancellation/error testing, run `pgrep -fl mpv`; confirm Pi Talk left no child process.
+15. Press `Ctrl+Shift+Space` while Gagged, Talking, and Paused; confirm it cycles through Talk, Pause, and Unpause without inserting text into the editor.
+16. Press `Ctrl+Shift+.` and `Ctrl+Shift+,`; confirm the footer and notification move by `0.10×`, respect the speed bounds, and do not insert punctuation into the editor.
 
 ## Automated coverage
 
@@ -121,6 +137,7 @@ Live tests call OpenAI and incur API cost. Run them only when intended.
 - cancellation before headers and during playback;
 - bounded cancellation when response-stream cleanup never settles;
 - mpv JSON IPC pause/resume without process suspension, including bounded control-failure teardown;
+- direct talk/pause and speed shortcuts sharing slash-command state and speed bounds;
 - process/stdin failures and `SIGTERM` to `SIGKILL` escalation;
 - header, body-idle, and total deadlines;
 - failed-cleanup poisoning that blocks unsafe replacement playback;

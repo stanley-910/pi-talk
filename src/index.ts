@@ -1,6 +1,17 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import {
+  COARSE_SPEED_STEP,
+  DEFAULT_PLAYBACK_SPEED,
+  FINE_SPEED_STEP,
+  MAX_PLAYBACK_SPEED,
+  MIN_PLAYBACK_SPEED,
+  clampPlaybackSpeed,
+  primaryShortcutAction,
+  registerPiTalkShortcuts,
+  type SpeechMode,
+} from "./controls.ts";
+import {
   OPENAI_SPEECH_MODEL,
   OPENAI_SPEECH_VOICE,
   OpenAISpeechPlayback,
@@ -11,16 +22,10 @@ import {
 } from "./speech.ts";
 
 const STATUS_ID = "pi-talk";
-const MIN_PLAYBACK_SPEED = 0.5;
-const MAX_PLAYBACK_SPEED = 3;
-const DEFAULT_PLAYBACK_SPEED = 1.25;
-const COARSE_SPEED_STEP = 0.1;
-const FINE_SPEED_STEP = 0.05;
 const AI_VOICE_DISCLOSURE =
   "AI voice: Pi Talk sends cleaned assistant text to OpenAI to generate speech. OpenAI may retain API content for up to 30 days for abuse monitoring unless your organization has approved data-retention controls. Audio is streamed to a local player and is not saved by Pi Talk.";
 
 type UiLevel = "info" | "warning" | "error";
-type SpeechMode = "gagged" | "talking" | "paused";
 
 type SpeechState = {
   mode: SpeechMode;
@@ -39,10 +44,6 @@ type SpeechState = {
   currentMessageComplete: boolean;
   seenQuestionCalls: Set<string>;
 };
-
-function clampPlaybackSpeed(speed: number): number {
-  return Math.round(Math.min(MAX_PLAYBACK_SPEED, Math.max(MIN_PLAYBACK_SPEED, speed)) * 100) / 100;
-}
 
 function configuredPlaybackSpeed(): number {
   const raw = process.env.PI_TALK_SPEED?.trim();
@@ -117,6 +118,13 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     ctx.ui.setStatus(STATUS_ID, `${provider}${label} · ${formatPlaybackSpeed(state.playbackSpeed)}`);
   }
 
+  function applyPlaybackSpeed(ctx: ExtensionContext, speed: number, reset = false) {
+    state.playbackSpeed = clampPlaybackSpeed(speed);
+    updateStatus();
+    const action = reset ? "reset" : "set";
+    notify(ctx, `Playback speed ${action} to ${formatPlaybackSpeed(state.playbackSpeed)} for the next utterance`);
+  }
+
   async function openPlaybackSpeedControl(ctx: ExtensionContext) {
     const selected = await ctx.ui.custom<number | undefined>((tui, theme, keybindings, done) => {
       let draft = state.playbackSpeed;
@@ -180,9 +188,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       return;
     }
 
-    state.playbackSpeed = selected;
-    updateStatus();
-    notify(ctx, `Playback speed set to ${formatPlaybackSpeed(state.playbackSpeed)} for the next utterance`);
+    applyPlaybackSpeed(ctx, selected);
   }
 
   function resetAccumulator() {
@@ -378,6 +384,60 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     return true;
   }
 
+  async function talkSpeech(ctx: ExtensionContext): Promise<void> {
+    const newestUtterances = state.currentMessageStreaming
+      ? []
+      : state.currentMessageComplete
+        ? state.currentUtterances
+        : state.latestCompleteUtterances;
+    const newest = newestUtterances.join(" ");
+    await startTalking(
+      ctx,
+      newest ? [newest] : [],
+      newest
+        ? "Talking from the start of the newest complete message"
+        : "Talking; waiting for the newest message to finish",
+    );
+  }
+
+  async function gagSpeech(ctx: ExtensionContext): Promise<void> {
+    state.mode = "gagged";
+    try {
+      await stopPlayback();
+      notify(ctx, "Pi Talk gagged");
+    } catch (error) {
+      notifySpeechError(error);
+    }
+    updateStatus();
+  }
+
+  async function pauseSpeech(ctx: ExtensionContext): Promise<void> {
+    if (state.mode === "gagged") {
+      notify(ctx, "Pi Talk is gagged; use /talk first", "warning");
+    } else if (state.mode === "paused") {
+      notify(ctx, "Speech is already paused");
+    } else {
+      await setSpeechPaused(ctx, true);
+    }
+    updateStatus();
+  }
+
+  async function unpauseSpeech(ctx: ExtensionContext): Promise<void> {
+    if (state.mode !== "paused") {
+      notify(ctx, "Speech is not paused", "warning");
+    } else {
+      await setSpeechPaused(ctx, false);
+    }
+    updateStatus();
+  }
+
+  async function activateSpeechShortcut(ctx: ExtensionContext): Promise<void> {
+    const action = primaryShortcutAction(state.mode);
+    if (action === "talk") await talkSpeech(ctx);
+    else if (action === "pause") await pauseSpeech(ctx);
+    else await unpauseSpeech(ctx);
+  }
+
   function describeState(): string {
     const activity = state.processing ? "playing" : "idle";
     const message = state.currentMessageStreaming
@@ -476,6 +536,11 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     state.activeContext = undefined;
   });
 
+  registerPiTalkShortcuts(pi, {
+    activate: activateSpeechShortcut,
+    adjustSpeed: (ctx, delta) => applyPlaybackSpeed(ctx, state.playbackSpeed + delta),
+  });
+
   pi.registerCommand("talk", {
     description: "Speak the newest assistant message and automatically speak new messages",
     handler: async (args, ctx) => {
@@ -488,47 +553,19 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       } else if (command) {
         notify(ctx, "Usage: /talk [test|status]", "warning");
       } else {
-        const newestUtterances = state.currentMessageStreaming
-          ? []
-          : state.currentMessageComplete
-            ? state.currentUtterances
-            : state.latestCompleteUtterances;
-        const newest = newestUtterances.join(" ");
-        await startTalking(
-          ctx,
-          newest ? [newest] : [],
-          newest
-            ? "Talking from the start of the newest complete message"
-            : "Talking; waiting for the newest message to finish",
-        );
+        await talkSpeech(ctx);
       }
     },
   });
 
   pi.registerCommand("pause", {
     description: "Freeze speech at its exact playback position",
-    handler: async (_args, ctx) => {
-      if (state.mode === "gagged") {
-        notify(ctx, "Pi Talk is gagged; use /talk first", "warning");
-      } else if (state.mode === "paused") {
-        notify(ctx, "Speech is already paused");
-      } else {
-        await setSpeechPaused(ctx, true);
-      }
-      updateStatus();
-    },
+    handler: async (_args, ctx) => pauseSpeech(ctx),
   });
 
   pi.registerCommand("unpause", {
     description: "Continue speech from its exact paused position",
-    handler: async (_args, ctx) => {
-      if (state.mode !== "paused") {
-        notify(ctx, "Speech is not paused", "warning");
-      } else {
-        await setSpeechPaused(ctx, false);
-      }
-      updateStatus();
-    },
+    handler: async (_args, ctx) => unpauseSpeech(ctx),
   });
 
   pi.registerCommand("speed", {
@@ -545,9 +582,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
       }
 
       if (command === "reset") {
-        state.playbackSpeed = DEFAULT_PLAYBACK_SPEED;
-        updateStatus();
-        notify(ctx, `Playback speed reset to ${formatPlaybackSpeed(state.playbackSpeed)} for the next utterance`);
+        applyPlaybackSpeed(ctx, DEFAULT_PLAYBACK_SPEED, true);
         return;
       }
 
@@ -557,23 +592,12 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
         return;
       }
 
-      state.playbackSpeed = clampPlaybackSpeed(requested);
-      updateStatus();
-      notify(ctx, `Playback speed set to ${formatPlaybackSpeed(state.playbackSpeed)} for the next utterance`);
+      applyPlaybackSpeed(ctx, requested);
     },
   });
 
   pi.registerCommand("gag", {
     description: "Stop speech, clear its queue, and disable automatic speaking",
-    handler: async (_args, ctx) => {
-      state.mode = "gagged";
-      try {
-        await stopPlayback();
-        notify(ctx, "Pi Talk gagged");
-      } catch (error) {
-        notifySpeechError(error);
-      }
-      updateStatus();
-    },
+    handler: async (_args, ctx) => gagSpeech(ctx),
   });
 }
