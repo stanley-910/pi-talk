@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import piTalk from "../src/index.ts";
+import { OPENAI_SPEECH_MODEL } from "../src/speech.ts";
 import {
   COARSE_SPEED_STEP,
   DEFAULT_PLAYBACK_SPEED,
@@ -122,40 +123,40 @@ test("direct shortcut and slash commands share the live speech state", async () 
 
     await commands.get("speed")?.handler("1.50", context);
     await invokeShortcut(SPEED_UP_SHORTCUT);
-    assert.match(lastStatus(), /1\.60×$/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ■ · 1.60×`);
     assert.equal(lastNotification().message, "Playback speed set to 1.60× for the next utterance");
     await invokeShortcut(SPEED_DOWN_SHORTCUT);
-    assert.match(lastStatus(), /1\.50×$/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ■ · 1.50×`);
     assert.equal(lastNotification().message, "Playback speed set to 1.50× for the next utterance");
 
     await commands.get("speed")?.handler("3.00", context);
     await invokeShortcut(SPEED_UP_SHORTCUT);
-    assert.match(lastStatus(), /3\.00×$/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ■ · 3.00×`);
     await commands.get("speed")?.handler("0.50", context);
     await invokeShortcut(SPEED_DOWN_SHORTCUT);
-    assert.match(lastStatus(), /0\.50×$/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ■ · 0.50×`);
     await commands.get("speed")?.handler("1.25", context);
 
     await invokeShortcut();
-    assert.match(lastStatus(), /\btalking\b/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ▶ · 1.25×`);
     assert.equal(lastNotification().message, "Talking; waiting for the newest message to finish");
 
     await invokeShortcut();
-    assert.match(lastStatus(), /\bpaused\b/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ⏸ · 1.25×`);
     assert.equal(lastNotification().message, "Speech paused at the current position");
 
     await invokeShortcut();
-    assert.match(lastStatus(), /\btalking\b/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ▶ · 1.25×`);
     assert.equal(lastNotification().message, "Speech continued from the paused position");
 
     await commands.get("gag")?.handler("", context);
-    assert.match(lastStatus(), /\bgagged\b/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ■ · 1.25×`);
     await commands.get("talk")?.handler("", context);
-    assert.match(lastStatus(), /\btalking\b/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ▶ · 1.25×`);
     await invokeShortcut();
-    assert.match(lastStatus(), /\bpaused\b/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ⏸ · 1.25×`);
     await commands.get("unpause")?.handler("", context);
-    assert.match(lastStatus(), /\btalking\b/);
+    assert.equal(lastStatus(), `${OPENAI_SPEECH_MODEL} · ▶ · 1.25×`);
   } finally {
     if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = previousKey;

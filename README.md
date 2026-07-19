@@ -27,7 +27,7 @@ Before first playback each session, Pi Talk states:
 
 > **AI voice:** Pi Talk sends cleaned assistant text to OpenAI to generate speech. OpenAI may retain API content for up to 30 days for abuse monitoring unless your organization has approved data-retention controls. Audio is streamed to a local player and is not saved by Pi Talk.
 
-While active, the footer includes `AI voice · OpenAI`. Pi Talk does not intentionally log or persist:
+The footer shows the pinned OpenAI model, playback indicator, and speed, for example `gpt-4o-mini-tts-2025-12-15 · ▶ · 1.25×`. Pi Talk does not intentionally log or persist:
 
 - API keys or authorization headers;
 - original or cleaned spoken text;
@@ -111,7 +111,7 @@ The `/speed` slider uses `j` to speed up and `k` to slow down by `0.10×`, shift
 Live tests call OpenAI and incur API cost. Run them only when intended.
 
 1. Start Pi Talk and confirm it reports **Gagged**.
-2. Run `/talk test`; confirm the disclosure appears before audio and the footer shows `AI voice · OpenAI`.
+2. Run `/talk test`; confirm the disclosure appears before audio and the footer shows the pinned model, `▶`, and current speed.
 3. Ask for a normal prose response; confirm speech starts only after message completion and sounds continuous.
 4. Ask for a response longer than 1,800 UTF-8 bytes; confirm all chunks play once, in order, with no overlap.
 5. Ask for fenced and inline code; confirm prose and inline-code text are spoken while the fence is silent.

@@ -109,13 +109,11 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     const ctx = state.activeContext;
     if (!ctx?.hasUI) return;
 
-    let label: string = state.mode;
-    if (state.mode === "talking" && (state.processing || state.queue.length > 0)) {
-      label = `talking (${state.queue.length} queued)`;
-    }
-
-    const provider = state.mode === "gagged" ? "" : "AI voice · OpenAI · ";
-    ctx.ui.setStatus(STATUS_ID, `${provider}${label} · ${formatPlaybackSpeed(state.playbackSpeed)}`);
+    const indicator = state.mode === "talking" ? "▶" : state.mode === "paused" ? "⏸" : "■";
+    ctx.ui.setStatus(
+      STATUS_ID,
+      `${OPENAI_SPEECH_MODEL} · ${indicator} · ${formatPlaybackSpeed(state.playbackSpeed)}`,
+    );
   }
 
   function applyPlaybackSpeed(ctx: ExtensionContext, speed: number, reset = false) {
