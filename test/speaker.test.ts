@@ -6,6 +6,8 @@ import type { ChildProcess } from "node:child_process";
 import { SpeechCancelledError, SpeechError } from "../src/speech.ts";
 import {
   KILL_GRACE_MS,
+  PAUSE_SIGNAL,
+  RESUME_SIGNAL,
   TERM_GRACE_MS,
   claimSpeaker,
   clearSpeakerRecord,
@@ -16,6 +18,7 @@ import {
   resolvePlaybackSpeed,
   runSpeakerCli,
   sanitizeFailure,
+  signalSpeaker,
   speakText,
   speakerLogPath,
   speakerPidPath,
@@ -69,6 +72,7 @@ type FakeProcess = {
 class FakeProbe implements ProcessProbe {
   readonly processes = new Map<number, FakeProcess>();
   readonly groupSignals: Array<{ pgid: number; signal: NodeJS.Signals }> = [];
+  readonly processSignals: Array<{ pid: number; signal: NodeJS.Signals }> = [];
 
   add(pid: number, options: Partial<FakeProcess> = {}): void {
     this.processes.set(pid, {
@@ -93,6 +97,10 @@ class FakeProbe implements ProcessProbe {
       if (found.pgid !== pgid || found.diesOn === "never") continue;
       if (signal === "SIGKILL" || found.diesOn === signal) this.processes.delete(pid);
     }
+  }
+
+  signalProcess(pid: number, signal: NodeJS.Signals): void {
+    this.processSignals.push({ pid, signal });
   }
 
   get signalNames(): NodeJS.Signals[] {
@@ -123,12 +131,28 @@ class FakeDaemon extends EventEmitter {
 class FakePlayback implements SpeakerPlayback {
   readonly spoken: string[] = [];
   readonly speeds: number[] = [];
+  /** Every setPaused the daemon drove, in order. */
+  readonly pausedCalls: boolean[] = [];
   cancelCount = 0;
   private pending?: (error: unknown) => void;
   private readonly hold: boolean;
 
   constructor(hold = false) {
     this.hold = hold;
+  }
+
+  get paused(): boolean {
+    return this.pausedCalls.at(-1) ?? false;
+  }
+
+  pause(): Promise<void> {
+    this.pausedCalls.push(true);
+    return Promise.resolve();
+  }
+
+  resume(): Promise<void> {
+    this.pausedCalls.push(false);
+    return Promise.resolve();
   }
 
   playChunk(text: string, playbackSpeed: number): Promise<void> {
@@ -571,6 +595,114 @@ test("the daemon speaks the same cleaned text the Pi extension would", async () 
   assert.equal(await runSpeakerCli(["--daemon"], environment), 0);
 
   assert.deepEqual(playback.spoken, ["Notes See for details."]);
+});
+
+test("SIGUSR1 and SIGUSR2 freeze and continue the daemon without tearing it down", async () => {
+  const playback = new FakePlayback(true);
+  const signals = new EventEmitter();
+  const { environment, files } = harness({
+    stdin: Readable.from(["A long answer that is still playing."]),
+    signals,
+    createPlayback: () => playback,
+  });
+
+  const pending = runSpeakerCli(["--daemon"], environment);
+  await waitFor(() => playback.spoken.length === 1);
+
+  signals.emit(PAUSE_SIGNAL);
+  await waitFor(() => playback.paused);
+  assert.equal(playback.cancelCount, 0);
+  assert.equal(files.entries.has(speakerPidPath(STATE_DIR)), true);
+
+  signals.emit(RESUME_SIGNAL);
+  await waitFor(() => !playback.paused);
+  assert.deepEqual(playback.pausedCalls, [true, false]);
+  assert.equal(playback.cancelCount, 0);
+
+  signals.emit("SIGTERM");
+  assert.equal(await pending, 0);
+  assert.equal(signals.listenerCount(PAUSE_SIGNAL), 0);
+  assert.equal(signals.listenerCount(RESUME_SIGNAL), 0);
+});
+
+test("--pause and --unpause signal the daemon pid alone, never the group", async () => {
+  const { environment, files, probe } = harness();
+  writeSpeakerRecord(STATE_DIR, files, { pid: 4_242, pgid: 4_242, startedAt: 1 });
+  probe.add(4_242);
+
+  assert.equal(await runSpeakerCli(["--pause"], environment), 0);
+  assert.equal(await runSpeakerCli(["--unpause"], environment), 0);
+
+  assert.deepEqual(probe.processSignals, [
+    { pid: 4_242, signal: "SIGUSR1" },
+    { pid: 4_242, signal: "SIGUSR2" },
+  ]);
+  assert.deepEqual(probe.groupSignals, []);
+  assert.equal(probe.isAlive(4_242), true);
+  assert.equal(files.entries.has(speakerPidPath(STATE_DIR)), true);
+});
+
+test("--pause and --unpause exit 0 silently when no live speaker holds the pidfile", async () => {
+  const absent = harness();
+  assert.equal(await runSpeakerCli(["--pause"], absent.environment), 0);
+  assert.equal(await runSpeakerCli(["--unpause"], absent.environment), 0);
+  assert.deepEqual(absent.probe.processSignals, []);
+  assert.deepEqual(absent.stderr, []);
+
+  const stale = harness();
+  writeSpeakerRecord(STATE_DIR, stale.files, { pid: 4_242, pgid: 4_242, startedAt: 1 });
+  assert.equal(await runSpeakerCli(["--pause"], stale.environment), 0);
+  assert.deepEqual(stale.probe.processSignals, []);
+  assert.deepEqual(stale.stderr, []);
+
+  const reused = harness();
+  writeSpeakerRecord(STATE_DIR, reused.files, { pid: 4_242, pgid: 4_242, startedAt: 1 });
+  reused.probe.add(4_242, { pgid: 900, command: "vim notes.md" });
+  assert.equal(await runSpeakerCli(["--pause"], reused.environment), 0);
+  assert.deepEqual(reused.probe.processSignals, []);
+  assert.deepEqual(reused.stderr, []);
+});
+
+test("a paused speaker still dies to --stop and to a takeover", async () => {
+  const stopped = harness();
+  writeSpeakerRecord(STATE_DIR, stopped.files, { pid: 4_242, pgid: 4_242, startedAt: 1 });
+  stopped.probe.add(4_242);
+
+  assert.equal(await runSpeakerCli(["--pause"], stopped.environment), 0);
+  assert.equal(await runSpeakerCli(["--stop"], stopped.environment), 0);
+
+  assert.deepEqual(stopped.probe.groupSignals, [{ pgid: 4_242, signal: "SIGTERM" }]);
+  assert.equal(stopped.probe.isAlive(4_242), false);
+  assert.equal(stopped.files.entries.has(speakerPidPath(STATE_DIR)), false);
+
+  const taken = harness();
+  writeSpeakerRecord(STATE_DIR, taken.files, { pid: 4_242, pgid: 4_242, startedAt: 1 });
+  taken.probe.add(4_242);
+  taken.probe.add(777);
+
+  assert.equal(await runSpeakerCli(["--pause"], taken.environment), 0);
+  await claimSpeaker(taken.environment, STATE_DIR);
+
+  assert.deepEqual(taken.probe.groupSignals, [{ pgid: 4_242, signal: "SIGTERM" }]);
+  assert.equal(taken.probe.isAlive(4_242), false);
+  assert.equal(readSpeakerRecord(STATE_DIR, taken.files)?.pid, 777);
+});
+
+test("--help lists the pause verbs", async () => {
+  const { environment, stdout } = harness();
+
+  assert.equal(await runSpeakerCli(["--help"], environment), 0);
+  assert.match(stdout.join(""), /--pause\s+freeze the current speaker/);
+  assert.match(stdout.join(""), /--unpause\s+continue a frozen speaker/);
+});
+
+test("signalSpeaker reports whether a live speaker received the signal", () => {
+  const { environment, files, probe } = harness();
+  assert.equal(signalSpeaker(environment, STATE_DIR, PAUSE_SIGNAL), false);
+
+  writeSpeakerRecord(STATE_DIR, files, { pid: 4_242, pgid: 4_242, startedAt: 1 });
+  probe.add(4_242);
+  assert.equal(signalSpeaker(environment, STATE_DIR, PAUSE_SIGNAL), true);
 });
 
 test("unknown errors never leak their message into the log", () => {
