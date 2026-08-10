@@ -1,6 +1,6 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
@@ -45,8 +45,9 @@ Environment:
   PI_TALK_SPEED    playback speed, ${MIN_PLAYBACK_SPEED.toFixed(2)}-${MAX_PLAYBACK_SPEED.toFixed(2)} (default ${DEFAULT_PLAYBACK_SPEED.toFixed(2)})
 
 Files:
-  <state dir>/${SPEED_FILE_NAME}   plain decimal speed, re-read before every chunk;
-                   outranks PI_TALK_SPEED, delete it to fall back (\`talk speed reset\`)
+  <state dir>/${SPEED_FILE_NAME}   plain decimal speed, applied to the audio already
+                   playing and re-read before every chunk; outranks
+                   PI_TALK_SPEED, delete it to fall back (\`talk speed reset\`)
 `;
 
 export type SpeakerErrorCode = "usage" | "configuration" | "input" | "unexpected";
@@ -99,7 +100,12 @@ export type SpeakerPlayback = {
   /** Exact-position freeze; absent on players that cannot pause. */
   pause?(): Promise<void>;
   resume?(): Promise<void>;
+  /** Retunes audio already playing; absent on players that only set speed at spawn. */
+  setSpeed?(speed: number): Promise<void>;
 };
+
+/** Stops a directory watch. Calling it twice is safe. */
+export type StopWatching = () => void;
 
 export type SpeakerEnvironment = {
   env: NodeJS.ProcessEnv;
@@ -115,6 +121,12 @@ export type SpeakerEnvironment = {
   sleep(milliseconds: number): Promise<void>;
   spawnDaemon(argv: string[]): ChildProcess;
   createPlayback(apiKey: string): SpeakerPlayback;
+  /**
+   * Watches `directory` for entry changes, reporting the entry name when the
+   * platform supplies one. Returns undefined when watching is unavailable, which
+   * is a downgrade rather than a failure: the per-chunk re-read still works.
+   */
+  watchDirectory(directory: string, onChange: (fileName: string | undefined) => void): StopWatching | undefined;
 };
 
 export function defaultFileSystem(): SpeakerFileSystem {
@@ -187,6 +199,28 @@ export function defaultProcessProbe(): ProcessProbe {
   };
 }
 
+/**
+ * Watches the directory rather than the file: editors and `talk speed` replace
+ * the speed file instead of writing through it, and a watch pinned to the old
+ * inode would go deaf after the first change.
+ */
+function defaultWatchDirectory(
+  directory: string,
+  onChange: (fileName: string | undefined) => void,
+): StopWatching | undefined {
+  try {
+    const watcher = watch(directory, (_event, fileName) => {
+      onChange(typeof fileName === "string" ? fileName : undefined);
+    });
+    // A watcher that dies mid-answer must not take the daemon with it.
+    watcher.on("error", () => watcher.close());
+    watcher.unref();
+    return () => watcher.close();
+  } catch {
+    return undefined;
+  }
+}
+
 function defaultSpawnDaemon(argv: string[]): ChildProcess {
   const [script, ...rest] = argv;
   return spawn(process.execPath, [script, ...rest], {
@@ -210,6 +244,7 @@ function defaultEnvironment(overrides: Partial<SpeakerEnvironment>): SpeakerEnvi
     sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
     spawnDaemon: defaultSpawnDaemon,
     createPlayback: (apiKey) => new OpenAISpeechPlayback({ apiKey }),
+    watchDirectory: defaultWatchDirectory,
     ...overrides,
   };
 }
@@ -292,10 +327,10 @@ export function resolvePlaybackSpeed(env: NodeJS.ProcessEnv): number {
 }
 
 /**
- * The speed knob `talk speed` turns. There is no IPC into a running daemon, so
- * the file is the channel: the daemon re-reads it before every chunk and the
- * newest value lands on the next one — a mid-utterance change costs one chunk
- * of latency, never a restart.
+ * The speed knob `talk speed` turns. The file is the channel into a daemon that
+ * is already talking; this reader is the floor of that channel, asked before
+ * every chunk so a new value lands at worst one chunk late. `watchPlaybackSpeed`
+ * sits on top and usually beats it to the punch by retuning the live audio.
  *
  * The file outranks `PI_TALK_SPEED`, which only seeds the daemon at spawn.
  * Deleting the file (`talk speed reset`) falls back to that seed. Unreadable or
@@ -320,6 +355,44 @@ export function createSpeedReader(
     if (parsed !== undefined) current = parsed;
     return current;
   };
+}
+
+/**
+ * Pushes speed-file edits onto the audio that is already playing, so a nudge is
+ * heard mid-sentence instead of at the next chunk — most answers are a single
+ * chunk, which made the per-chunk re-read alone arrive after the fact.
+ *
+ * Deliberately quiet in three cases. Garbage (a half-written file caught
+ * mid-save) and a removed file both mean "leave the audio alone": removal asks
+ * for the spawn speed back at the *next* chunk, not a lurch in this one. A value
+ * that repeats the one already applied is dropped because a single save fires
+ * several filesystem events.
+ *
+ * Its notion of the current speed is its own, and drifting from the per-chunk
+ * reader is correct: after a removal the reader falls back while the live audio
+ * keeps playing at the speed it was last given.
+ */
+export function watchPlaybackSpeed(
+  environment: SpeakerEnvironment,
+  stateDir: string,
+  initialSpeed: number,
+  applySpeed: (speed: number) => void,
+): StopWatching {
+  let applied = initialSpeed;
+
+  const stop = environment.watchDirectory(stateDir, (fileName) => {
+    // Platforms that omit the name make us re-read; the dedupe below absorbs it.
+    if (fileName !== undefined && fileName !== SPEED_FILE_NAME) return;
+
+    const parsed = parsePlaybackSpeed(environment.files.readText(speakerSpeedPath(stateDir)));
+    if (parsed === undefined || parsed === applied) return;
+
+    applied = parsed;
+    applySpeed(parsed);
+  });
+
+  // Watching is a bonus, not a requirement: without it the per-chunk read stands.
+  return stop ?? (() => undefined);
 }
 
 export function readSpeakerRecord(stateDir: string, files: SpeakerFileSystem): SpeakerRecord | undefined {
@@ -541,6 +614,7 @@ async function runDaemon(environment: SpeakerEnvironment, stateDir: string): Pro
 
   let cancelled = false;
   let playback: SpeakerPlayback | undefined;
+  let stopWatchingSpeed: StopWatching | undefined;
   const onTerminate = () => {
     cancelled = true;
     void playback?.cancel().catch(() => undefined);
@@ -568,6 +642,10 @@ async function runDaemon(environment: SpeakerEnvironment, stateDir: string): Pro
       environment.files,
       resolvePlaybackSpeed(environment.env),
     );
+    stopWatchingSpeed = watchPlaybackSpeed(environment, stateDir, resolveSpeed(), (speed) => {
+      // Losing the retune is survivable: the next chunk reads the same file.
+      void playback?.setSpeed?.(speed).catch(() => undefined);
+    });
     await speakText(text, playback, resolveSpeed, () => cancelled);
     return 0;
   } catch (error) {
@@ -575,6 +653,7 @@ async function runDaemon(environment: SpeakerEnvironment, stateDir: string): Pro
     logSpeakerFailure(environment, stateDir, error);
     return 1;
   } finally {
+    stopWatchingSpeed?.();
     environment.signals.removeListener("SIGTERM", onTerminate);
     environment.signals.removeListener(PAUSE_SIGNAL, onPause);
     environment.signals.removeListener(RESUME_SIGNAL, onResume);

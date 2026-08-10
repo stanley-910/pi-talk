@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
 import type { EventEmitter } from "node:events";
 import type { Duplex, Readable, Writable } from "node:stream";
+import { clampPlaybackSpeed } from "./controls.ts";
 
 export const OPENAI_SPEECH_URL = "https://api.openai.com/v1/audio/speech";
 export const OPENAI_SPEECH_MODEL = "gpt-4o-mini-tts-2025-12-15";
@@ -276,7 +277,8 @@ class MpvIpcClient {
     stream.on("close", () => this.fail(new Error("mpv IPC stream closed")));
   }
 
-  setPaused(paused: boolean): Promise<void> {
+  /** Retunes one mpv property on the audio already playing; resolves on its reply. */
+  setProperty(property: string, value: boolean | number): Promise<void> {
     if (this.failure) return Promise.reject(this.failure);
 
     const requestId = ++this.sequence;
@@ -286,7 +288,7 @@ class MpvIpcClient {
 
     try {
       this.stream.write(
-        `${JSON.stringify({ command: ["set_property", "pause", paused], request_id: requestId })}\n`,
+        `${JSON.stringify({ command: ["set_property", property, value], request_id: requestId })}\n`,
       );
     } catch {
       this.fail(new Error("mpv IPC write failed"));
@@ -322,7 +324,7 @@ class MpvIpcClient {
       if (!request) continue;
       this.pending.delete(message.request_id);
       if (message.error === "success") request.resolve();
-      else request.reject(new Error("mpv IPC pause command failed"));
+      else request.reject(new Error("mpv IPC command failed"));
     }
   }
 
@@ -556,30 +558,60 @@ export class OpenAISpeechPlayback {
     }
   }
 
+  /**
+   * Retunes the audio that is already playing, pitch-corrected, instead of
+   * waiting for the next chunk to be spawned at the new rate. Speeds outside
+   * the supported range are clamped rather than refused, and a non-finite one
+   * is ignored: a bad number must never reach mpv as JSON `null`.
+   *
+   * Silent when nothing is playing — the next chunk carries its own speed, so
+   * there is no state here to remember (unlike pause, which must survive the
+   * gap between chunks).
+   */
+  async setSpeed(speed: number): Promise<void> {
+    if (!Number.isFinite(speed)) return;
+
+    const active = this.active;
+    if (!active?.playerControl) return;
+    await this.sendProperty(active, "speed", clampPlaybackSpeed(speed), "Speech player speed control failed");
+  }
+
   private async setPaused(paused: boolean): Promise<void> {
     const active = this.active;
-    const control = active?.playerControl;
-    if (!control) {
+    if (!active?.playerControl) {
       this.paused = paused;
       return;
     }
 
+    await this.sendProperty(active, "pause", paused, "Speech player pause control failed");
+    this.paused = paused;
+  }
+
+  /**
+   * One bounded IPC round trip. A control that errors, times out, or races a
+   * teardown stops the playback it belongs to rather than leaving mpv tuned to
+   * a state the daemon no longer believes in.
+   */
+  private async sendProperty(
+    active: ActivePlayback,
+    property: string,
+    value: boolean | number,
+    failureDetail: string,
+  ): Promise<void> {
+    const control = active.playerControl;
+    if (!control) return;
+
     let timer: NodeJS.Timeout | undefined;
     try {
       await Promise.race([
-        control.setPaused(paused),
+        control.setProperty(property, value),
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(() => reject(new Error("mpv IPC command timed out")), this.timeouts.controlMs);
         }),
       ]);
-      this.paused = paused;
     } catch {
       if (active.cancelled || this.active !== active) throw new SpeechCancelledError();
-      const failure = new SpeechError(
-        "playback",
-        "Speech playback control failed.",
-        "Speech player pause control failed",
-      );
+      const failure = new SpeechError("playback", "Speech playback control failed.", failureDetail);
       active.interrupt(failure);
       throw failure;
     } finally {
