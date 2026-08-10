@@ -76,6 +76,27 @@ To run deterministic, non-billable tests:
 npm test
 ```
 
+## Speaker CLI
+
+`bin/cc-talk-speak` speaks arbitrary text through the same engine from any shell, with no Pi session involved:
+
+```sh
+echo "Some prose to read aloud." | bin/cc-talk-speak
+bin/cc-talk-speak --file /tmp/response.txt   # the file is deleted after it is read
+bin/cc-talk-speak --stop                     # always exits 0, even with nothing playing
+```
+
+The CLI reads its text, then respawns itself detached so the caller returns immediately. The daemon leads its own process group, which the `mpv` it spawns joins, so a single group signal reaches both and no orphaned player survives.
+
+Speaker state lives in `~/.claude/cc-talk/` (override with `CC_TALK_STATE_DIR`):
+
+- `speaker.pid` records the current daemon's pid and process-group id. A newer speaker terminates the recorded group with the same `SIGTERM` → 250 ms → `SIGKILL` → 1,000 ms ladder the extension uses, then claims the file. Newest wins, globally, across sessions. Because pids are recycled, a recorded pid counts as live only when it is still a group leader whose command line is a speaker.
+- `speaker.log` collects sanitized one-line failures. No keys, no provider bodies, no spoken text.
+
+The daemon answers `SIGTERM` by running the graceful cancel path first, so supersession is clean before the ladder escalates. If `OPENAI_API_KEY` is unset, the CLI reads `export KEY=value` lines from `~/.secrets/env` before failing. `PI_TALK_SPEED` applies with the usual `0.50×–3.00×` bounds and `1.25×` default.
+
+Node 23+ is required: the executable is plain JavaScript that imports the TypeScript module through native type stripping. It adds no runtime dependencies.
+
 ## Controls
 
 ```text
@@ -143,6 +164,9 @@ Live tests call OpenAI and incur API cost. Run them only when intended.
 - failed-cleanup poisoning that blocks unsafe replacement playback;
 - no retry and sanitized provider failures;
 - rejection of overlapping playback;
-- LaTeX removal without swallowing ordinary currency prose.
+- LaTeX removal without swallowing ordinary currency prose;
+- speaker-CLI pidfile takeover, including reused and dead pids, and `--stop` ladder escalation;
+- `--file` unlinking, detached daemon handoff, and `SIGTERM` graceful cancel;
+- `~/.secrets/env` key fallback, speed bounds, and sanitized speaker-log lines.
 
 See [`NOTES.md`](NOTES.md) for the earlier live prototype observations that led to this contract.

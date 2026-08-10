@@ -1,0 +1,13 @@
+#!/usr/bin/env node
+// cc-talk-speak — speak text through the Pi Talk speech engine from any shell.
+//
+// Plain JavaScript on purpose: an extensionless entry point cannot be
+// type-stripped, so the TypeScript lives in ../src/speaker.ts, which Node >= 23
+// strips natively when it is imported.
+
+import { fileURLToPath } from "node:url";
+import { runSpeakerCli } from "../src/speaker.ts";
+
+process.exitCode = await runSpeakerCli(process.argv.slice(2), {
+  entryScript: fileURLToPath(import.meta.url),
+});
