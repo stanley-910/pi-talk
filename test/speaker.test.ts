@@ -11,6 +11,7 @@ import {
   TERM_GRACE_MS,
   claimSpeaker,
   clearSpeakerRecord,
+  createSpeedReader,
   isSpeakerRecordLive,
   parseSecretsEnv,
   readSpeakerRecord,
@@ -23,6 +24,7 @@ import {
   speakText,
   speakerLogPath,
   speakerPidPath,
+  speakerSpeedPath,
   speakerStatePath,
   updateSpeakerState,
   writeSpeakerRecord,
@@ -375,6 +377,74 @@ test("resolvePlaybackSpeed defaults to 1.25 and rejects out-of-bounds values", (
   assert.equal(resolvePlaybackSpeed({ PI_TALK_SPEED: "fast" }), 1.25);
 });
 
+test("the speed file outranks the spawn speed and is re-read on every call", () => {
+  const files = memoryFileSystem();
+  const readSpeed = createSpeedReader(STATE_DIR, files, 1.75);
+
+  assert.equal(readSpeed(), 1.75);
+
+  files.writeText(speakerSpeedPath(STATE_DIR), "2.00\n");
+  assert.equal(readSpeed(), 2);
+
+  files.writeText(speakerSpeedPath(STATE_DIR), "0.50");
+  assert.equal(readSpeed(), 0.5);
+});
+
+test("unreadable or out-of-range speed content keeps the last good speed", () => {
+  const files = memoryFileSystem();
+  const readSpeed = createSpeedReader(STATE_DIR, files, 1.25);
+
+  files.writeText(speakerSpeedPath(STATE_DIR), "2.00");
+  assert.equal(readSpeed(), 2);
+
+  for (const garbage of ["", "   ", "fast", "9.00", "0.10", "1.5 2.5"]) {
+    files.writeText(speakerSpeedPath(STATE_DIR), garbage);
+    assert.equal(readSpeed(), 2, `expected ${JSON.stringify(garbage)} to be ignored`);
+  }
+});
+
+test("removing the speed file falls back to the spawn speed", () => {
+  const files = memoryFileSystem();
+  const readSpeed = createSpeedReader(STATE_DIR, files, 1.75);
+
+  files.writeText(speakerSpeedPath(STATE_DIR), "3.00");
+  assert.equal(readSpeed(), 3);
+
+  files.remove(speakerSpeedPath(STATE_DIR));
+  assert.equal(readSpeed(), 1.75);
+});
+
+test("a speed written mid-utterance lands on the next chunk", async () => {
+  const spoken: string[] = [];
+  const speeds: number[] = [];
+  const files = memoryFileSystem();
+
+  // Long enough that splitSpeechText produces several chunks to span.
+  const long = Array.from({ length: 400 }, (_, index) => `Sentence ${index} carries on.`).join(" ");
+
+  await speakText(
+    long,
+    {
+      playChunk: (text, speed) => {
+        spoken.push(text);
+        speeds.push(speed);
+        // The knob turns while chunk one is still playing.
+        if (speeds.length === 1) files.writeText(speakerSpeedPath(STATE_DIR), "2.50");
+        return Promise.resolve();
+      },
+      cancel: () => Promise.resolve(),
+    },
+    createSpeedReader(STATE_DIR, files, 1.25),
+  );
+
+  assert.ok(spoken.length >= 2);
+  assert.equal(speeds[0], 1.25);
+  assert.ok(
+    speeds.slice(1).every((speed) => speed === 2.5),
+    `expected every later chunk at 2.50, got ${speeds.join(", ")}`,
+  );
+});
+
 test("--file reads the request, unlinks it, and hands the text to a detached daemon", async () => {
   const daemons: FakeDaemon[] = [];
   const spawned: string[][] = [];
@@ -455,6 +525,21 @@ test("the daemon claims the speaker, speaks every chunk, then releases the pidfi
   assert.deepEqual(playback.speeds, [1.75]);
   assert.equal(files.entries.has(speakerPidPath(STATE_DIR)), false);
   assert.equal(files.entries.has(speakerLogPath(STATE_DIR)), false);
+});
+
+test("the daemon prefers the speed file over PI_TALK_SPEED", async () => {
+  const playback = new FakePlayback();
+  const { environment, files, probe } = harness({
+    stdin: Readable.from(["Speed check."]),
+    env: { PI_TALK_SPEED: "1.75" },
+    createPlayback: () => playback,
+  });
+  files.writeText(speakerSpeedPath(STATE_DIR), "2.25\n");
+  probe.add(777, { pgid: 777 });
+
+  assert.equal(await runSpeakerCli(["--daemon"], environment), 0);
+
+  assert.deepEqual(playback.speeds, [2.25]);
 });
 
 test("SIGTERM cancels the daemon gracefully and exits quietly", async () => {
@@ -550,7 +635,7 @@ test("speakText strips math, orders chunks, and stops once cancelled", async () 
   const playback = new FakePlayback();
   const long = Array.from({ length: 400 }, (_, index) => `Sentence ${index} about $$x$$ things.`).join(" ");
 
-  await speakText(long, playback, 1.25);
+  await speakText(long, playback, () => 1.25);
   assert.ok(playback.spoken.length > 1);
   assert.ok(playback.spoken.every((chunk) => !chunk.includes("$$")));
 
@@ -565,7 +650,7 @@ test("speakText strips math, orders chunks, and stops once cancelled", async () 
       },
       cancel: () => stopping.cancel(),
     },
-    1.25,
+    () => 1.25,
     () => cancelled,
   );
   assert.equal(stopping.spoken.length, 1);
@@ -583,7 +668,7 @@ test("the speaker path never speaks fenced code, URLs, or markdown syntax", asyn
     "Call `teardown()` first.",
   ].join("\n");
 
-  await speakText(markdown, playback, 1.25);
+  await speakText(markdown, playback, () => 1.25);
 
   assert.deepEqual(playback.spoken, ["Here is the fix: Call teardown() first."]);
 });
