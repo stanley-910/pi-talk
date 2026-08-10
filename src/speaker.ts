@@ -1,0 +1,480 @@
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { ChildProcess } from "node:child_process";
+import type { EventEmitter } from "node:events";
+import type { Readable } from "node:stream";
+import { DEFAULT_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED, MIN_PLAYBACK_SPEED } from "./controls.ts";
+import {
+  OpenAISpeechPlayback,
+  SpeechCancelledError,
+  SpeechError,
+  splitSpeechText,
+  stripDelimitedMath,
+} from "./speech.ts";
+
+/** Substring every speaker command line carries, used to reject reused pids. */
+export const SPEAKER_MARKER = "cc-talk-speak";
+export const SPEAKER_STATE_DIR_ENV = "CC_TALK_STATE_DIR";
+export const PID_FILE_NAME = "speaker.pid";
+export const LOG_FILE_NAME = "speaker.log";
+export const SECRETS_FILE_NAME = ".secrets/env";
+
+/** Mirrors the speech.ts teardown ladder (src/speech.ts:668-672). */
+export const TERM_GRACE_MS = 250;
+export const KILL_GRACE_MS = 1_000;
+const LIVENESS_POLL_MS = 10;
+
+const USAGE = `Usage:
+  cc-talk-speak [--file <path>]   speak text from <path> (deleted after reading) or stdin
+  cc-talk-speak --stop            stop the current speaker
+  cc-talk-speak --help            show this message
+
+Environment:
+  OPENAI_API_KEY   required; falls back to ~/.secrets/env
+  PI_TALK_SPEED    playback speed, ${MIN_PLAYBACK_SPEED.toFixed(2)}-${MAX_PLAYBACK_SPEED.toFixed(2)} (default ${DEFAULT_PLAYBACK_SPEED.toFixed(2)})
+`;
+
+export type SpeakerErrorCode = "usage" | "configuration" | "input" | "unexpected";
+
+/** Carries a message that is already safe to write to the speaker log. */
+export class SpeakerError extends Error {
+  readonly code: SpeakerErrorCode;
+  readonly userMessage: string;
+
+  constructor(code: SpeakerErrorCode, userMessage: string) {
+    super(userMessage);
+    this.name = "SpeakerError";
+    this.code = code;
+    this.userMessage = userMessage;
+  }
+}
+
+export type SpeakerRecord = {
+  pid: number;
+  pgid: number;
+  startedAt: number;
+};
+
+export type ProcessDescription = {
+  pgid: number;
+  command: string;
+};
+
+export type ProcessProbe = {
+  isAlive(pid: number): boolean;
+  describe(pid: number): ProcessDescription | undefined;
+  signalGroup(pgid: number, signal: NodeJS.Signals): void;
+};
+
+export type SpeakerFileSystem = {
+  ensureDirectory(path: string): void;
+  readText(path: string): string | undefined;
+  writeText(path: string, contents: string): void;
+  appendText(path: string, contents: string): void;
+  remove(path: string): void;
+};
+
+export type SpeakerPlayback = {
+  playChunk(text: string, playbackSpeed: number): Promise<void>;
+  cancel(): Promise<void>;
+};
+
+export type SpeakerEnvironment = {
+  env: NodeJS.ProcessEnv;
+  files: SpeakerFileSystem;
+  probe: ProcessProbe;
+  signals: EventEmitter;
+  stdin: Readable;
+  stdout: { write(chunk: string): unknown };
+  stderr: { write(chunk: string): unknown };
+  entryScript: string;
+  pid: number;
+  now(): number;
+  sleep(milliseconds: number): Promise<void>;
+  spawnDaemon(argv: string[]): ChildProcess;
+  createPlayback(apiKey: string): SpeakerPlayback;
+};
+
+export function defaultFileSystem(): SpeakerFileSystem {
+  return {
+    ensureDirectory(path) {
+      mkdirSync(path, { recursive: true, mode: 0o700 });
+    },
+    readText(path) {
+      try {
+        return readFileSync(path, "utf8");
+      } catch {
+        return undefined;
+      }
+    },
+    writeText(path, contents) {
+      writeFileSync(path, contents, { encoding: "utf8", mode: 0o600 });
+    },
+    appendText(path, contents) {
+      appendFileSync(path, contents, { encoding: "utf8", mode: 0o600 });
+    },
+    remove(path) {
+      rmSync(path, { force: true });
+    },
+  };
+}
+
+export function defaultProcessProbe(): ProcessProbe {
+  return {
+    isAlive(pid) {
+      if (!Number.isInteger(pid) || pid <= 1) return false;
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "EPERM";
+      }
+    },
+    describe(pid) {
+      if (!Number.isInteger(pid) || pid <= 1) return undefined;
+      let output: string;
+      try {
+        output = execFileSync("ps", ["-o", "pgid=,command=", "-p", String(pid)], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+      } catch {
+        return undefined;
+      }
+      const match = /^\s*(\d+)\s+(.*)$/.exec(output.trim());
+      if (!match) return undefined;
+      return { pgid: Number(match[1]), command: match[2] };
+    },
+    signalGroup(pgid, signal) {
+      // Guard against signalling init or every process the user owns.
+      if (!Number.isInteger(pgid) || pgid <= 1) return;
+      try {
+        process.kill(-pgid, signal);
+      } catch {
+        // The group is already gone; supersession is still satisfied.
+      }
+    },
+  };
+}
+
+function defaultSpawnDaemon(argv: string[]): ChildProcess {
+  const [script, ...rest] = argv;
+  return spawn(process.execPath, [script, ...rest], {
+    detached: true,
+    stdio: ["pipe", "ignore", "ignore"],
+  });
+}
+
+function defaultEnvironment(overrides: Partial<SpeakerEnvironment>): SpeakerEnvironment {
+  return {
+    env: process.env,
+    files: defaultFileSystem(),
+    probe: defaultProcessProbe(),
+    signals: process as unknown as EventEmitter,
+    stdin: process.stdin,
+    stdout: process.stdout,
+    stderr: process.stderr,
+    entryScript: process.argv[1] ?? "",
+    pid: process.pid,
+    now: () => Date.now(),
+    sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    spawnDaemon: defaultSpawnDaemon,
+    createPlayback: (apiKey) => new OpenAISpeechPlayback({ apiKey }),
+    ...overrides,
+  };
+}
+
+export function speakerStateDir(env: NodeJS.ProcessEnv): string {
+  const override = env[SPEAKER_STATE_DIR_ENV]?.trim();
+  if (override) return override;
+  return join(env.HOME?.trim() || homedir(), ".claude", "cc-talk");
+}
+
+export function speakerPidPath(stateDir: string): string {
+  return join(stateDir, PID_FILE_NAME);
+}
+
+export function speakerLogPath(stateDir: string): string {
+  return join(stateDir, LOG_FILE_NAME);
+}
+
+export function secretsPath(env: NodeJS.ProcessEnv): string {
+  return join(env.HOME?.trim() || homedir(), SECRETS_FILE_NAME);
+}
+
+/**
+ * Reads `KEY=value` and `export KEY=value` lines. Values are never logged or
+ * echoed anywhere; only the requested key is ever read back out.
+ */
+export function parseSecretsEnv(contents: string): Record<string, string> {
+  const values: Record<string, string> = {};
+
+  for (const rawLine of contents.split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+
+    const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
+    if (!match) continue;
+
+    const value = match[2].trim();
+    const quoted = /^(["'])([\s\S]*)\1$/.exec(value);
+    values[match[1]] = quoted ? quoted[2] : value;
+  }
+
+  return values;
+}
+
+export function resolveApiKey(env: NodeJS.ProcessEnv, readSecrets: () => string | undefined): string {
+  const direct = env.OPENAI_API_KEY?.trim();
+  if (direct) return direct;
+
+  const contents = readSecrets();
+  const fallback = contents ? parseSecretsEnv(contents).OPENAI_API_KEY?.trim() : undefined;
+  if (fallback) return fallback;
+
+  throw new SpeakerError(
+    "configuration",
+    "OPENAI_API_KEY is not set and ~/.secrets/env does not define it.",
+  );
+}
+
+export function resolvePlaybackSpeed(env: NodeJS.ProcessEnv): number {
+  const raw = env.PI_TALK_SPEED?.trim();
+  if (!raw) return DEFAULT_PLAYBACK_SPEED;
+
+  const configured = Number(raw);
+  return Number.isFinite(configured) && configured >= MIN_PLAYBACK_SPEED && configured <= MAX_PLAYBACK_SPEED
+    ? configured
+    : DEFAULT_PLAYBACK_SPEED;
+}
+
+export function readSpeakerRecord(stateDir: string, files: SpeakerFileSystem): SpeakerRecord | undefined {
+  const contents = files.readText(speakerPidPath(stateDir));
+  if (!contents) return undefined;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(contents);
+  } catch {
+    return undefined;
+  }
+
+  const record = parsed as Partial<SpeakerRecord> | null;
+  if (!record || !Number.isInteger(record.pid) || !Number.isInteger(record.pgid)) return undefined;
+  return {
+    pid: record.pid as number,
+    pgid: record.pgid as number,
+    startedAt: Number.isFinite(record.startedAt) ? (record.startedAt as number) : 0,
+  };
+}
+
+export function writeSpeakerRecord(stateDir: string, files: SpeakerFileSystem, record: SpeakerRecord): void {
+  files.ensureDirectory(stateDir);
+  files.writeText(speakerPidPath(stateDir), `${JSON.stringify(record)}\n`);
+}
+
+/** Deletes the pidfile only while it still names `pid`, so a newer speaker survives. */
+export function clearSpeakerRecord(stateDir: string, files: SpeakerFileSystem, pid: number): void {
+  const current = readSpeakerRecord(stateDir, files);
+  if (current && current.pid !== pid) return;
+  files.remove(speakerPidPath(stateDir));
+}
+
+/**
+ * A pid alone cannot be trusted: the kernel reuses them. A record is live only
+ * when the process exists, still leads the recorded group, and still looks like
+ * a speaker.
+ */
+export function isSpeakerRecordLive(record: SpeakerRecord, probe: ProcessProbe): boolean {
+  if (!probe.isAlive(record.pid)) return false;
+
+  const description = probe.describe(record.pid);
+  if (!description) return false;
+  return description.pgid === record.pgid && description.command.includes(SPEAKER_MARKER);
+}
+
+async function waitForExit(
+  pid: number,
+  probe: ProcessProbe,
+  graceMs: number,
+  sleep: (milliseconds: number) => Promise<void>,
+): Promise<boolean> {
+  const attempts = Math.max(1, Math.ceil(graceMs / LIVENESS_POLL_MS));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (!probe.isAlive(pid)) return true;
+    await sleep(LIVENESS_POLL_MS);
+  }
+  return !probe.isAlive(pid);
+}
+
+/**
+ * SIGTERM to the whole group (daemon plus the mpv it spawned), then SIGKILL,
+ * mirroring the in-process ladder at src/speech.ts:668-672.
+ */
+export async function terminateSpeakerGroup(
+  record: SpeakerRecord,
+  probe: ProcessProbe,
+  sleep: (milliseconds: number) => Promise<void>,
+): Promise<boolean> {
+  probe.signalGroup(record.pgid, "SIGTERM");
+  if (await waitForExit(record.pid, probe, TERM_GRACE_MS, sleep)) return true;
+
+  probe.signalGroup(record.pgid, "SIGKILL");
+  return waitForExit(record.pid, probe, KILL_GRACE_MS, sleep);
+}
+
+/** Newest wins: stop whoever holds the state dir, then record ourselves. */
+export async function claimSpeaker(environment: SpeakerEnvironment, stateDir: string): Promise<SpeakerRecord> {
+  const previous = readSpeakerRecord(stateDir, environment.files);
+  if (previous && previous.pid !== environment.pid && isSpeakerRecordLive(previous, environment.probe)) {
+    await terminateSpeakerGroup(previous, environment.probe, environment.sleep);
+  }
+
+  const pgid = environment.probe.describe(environment.pid)?.pgid ?? environment.pid;
+  const record: SpeakerRecord = { pid: environment.pid, pgid, startedAt: environment.now() };
+  writeSpeakerRecord(stateDir, environment.files, record);
+  return record;
+}
+
+/** Always succeeds, including when nothing is playing. */
+export async function stopSpeaker(environment: SpeakerEnvironment, stateDir: string): Promise<void> {
+  const record = readSpeakerRecord(stateDir, environment.files);
+  if (!record) return;
+
+  if (isSpeakerRecordLive(record, environment.probe)) {
+    await terminateSpeakerGroup(record, environment.probe, environment.sleep);
+  }
+  clearSpeakerRecord(stateDir, environment.files, record.pid);
+}
+
+/** Never returns provider bodies, spoken text, paths, or key material. */
+export function sanitizeFailure(error: unknown): string {
+  if (error instanceof SpeechError) return `${error.code}: ${error.userMessage}`;
+  if (error instanceof SpeakerError) return `${error.code}: ${error.userMessage}`;
+  return "unexpected: cc-talk-speak failed";
+}
+
+export function logSpeakerFailure(environment: SpeakerEnvironment, stateDir: string, error: unknown): void {
+  const line = `${new Date(environment.now()).toISOString()} ${sanitizeFailure(error)}\n`;
+  try {
+    environment.files.ensureDirectory(stateDir);
+    environment.files.appendText(speakerLogPath(stateDir), line);
+  } catch {
+    // A speaker that cannot log still must not crash the caller's shell.
+  }
+}
+
+export async function speakText(
+  text: string,
+  playback: SpeakerPlayback,
+  playbackSpeed: number,
+  isCancelled: () => boolean = () => false,
+): Promise<void> {
+  const chunks = splitSpeechText(stripDelimitedMath(text));
+  for (const chunk of chunks) {
+    if (isCancelled()) return;
+    await playback.playChunk(chunk, playbackSpeed);
+  }
+}
+
+async function readAll(stream: Readable): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function launchDaemon(environment: SpeakerEnvironment, text: string): Promise<number> {
+  if (!text.trim()) return 0;
+  if (!environment.entryScript) {
+    throw new SpeakerError("unexpected", "The speaker could not locate its own executable.");
+  }
+
+  const child = environment.spawnDaemon([environment.entryScript, "--daemon"]);
+  if (!child.stdin) throw new SpeakerError("unexpected", "The speaker daemon rejected its input pipe.");
+
+  const flushed = once(child.stdin, "finish");
+  child.stdin.end(text);
+  child.unref();
+  await flushed;
+  return 0;
+}
+
+async function runDaemon(environment: SpeakerEnvironment, stateDir: string): Promise<number> {
+  const text = await readAll(environment.stdin);
+  if (!text.trim()) return 0;
+
+  await claimSpeaker(environment, stateDir);
+
+  let cancelled = false;
+  let playback: SpeakerPlayback | undefined;
+  const onTerminate = () => {
+    cancelled = true;
+    void playback?.cancel().catch(() => undefined);
+  };
+  environment.signals.once("SIGTERM", onTerminate);
+
+  try {
+    const apiKey = resolveApiKey(environment.env, () => environment.files.readText(secretsPath(environment.env)));
+    playback = environment.createPlayback(apiKey);
+    if (cancelled) return 0;
+    await speakText(text, playback, resolvePlaybackSpeed(environment.env), () => cancelled);
+    return 0;
+  } catch (error) {
+    if (cancelled || error instanceof SpeechCancelledError) return 0;
+    logSpeakerFailure(environment, stateDir, error);
+    return 1;
+  } finally {
+    environment.signals.removeListener("SIGTERM", onTerminate);
+    clearSpeakerRecord(stateDir, environment.files, environment.pid);
+  }
+}
+
+export async function runSpeakerCli(
+  argv: string[],
+  overrides: Partial<SpeakerEnvironment> = {},
+): Promise<number> {
+  const environment = defaultEnvironment(overrides);
+  const stateDir = speakerStateDir(environment.env);
+
+  try {
+    if (argv.includes("--help") || argv.includes("-h")) {
+      environment.stdout.write(USAGE);
+      return 0;
+    }
+
+    if (argv.includes("--stop")) {
+      await stopSpeaker(environment, stateDir);
+      return 0;
+    }
+
+    if (argv.includes("--daemon")) return await runDaemon(environment, stateDir);
+
+    const fileIndex = argv.indexOf("--file");
+    if (fileIndex >= 0) {
+      const path = argv[fileIndex + 1];
+      if (!path) throw new SpeakerError("usage", "--file requires a path.");
+
+      const text = environment.files.readText(path);
+      environment.files.remove(path);
+      if (text === undefined) throw new SpeakerError("input", "The speech input file could not be read.");
+      return await launchDaemon(environment, text);
+    }
+
+    const unknown = argv.find((argument) => argument.startsWith("-"));
+    if (unknown) throw new SpeakerError("usage", "Unrecognized option.");
+
+    return await launchDaemon(environment, await readAll(environment.stdin));
+  } catch (error) {
+    const message = sanitizeFailure(error);
+    environment.stderr.write(`cc-talk-speak: ${message}\n`);
+    if (error instanceof SpeakerError && error.code === "usage") {
+      environment.stderr.write(USAGE);
+      return 2;
+    }
+    logSpeakerFailure(environment, stateDir, error);
+    return 1;
+  }
+}
