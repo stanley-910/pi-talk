@@ -8,6 +8,8 @@ import {
   KILL_GRACE_MS,
   PAUSE_SIGNAL,
   RESUME_SIGNAL,
+  SPEED_FILE_NAME,
+  STATE_FILE_NAME,
   TERM_GRACE_MS,
   claimSpeaker,
   clearSpeakerRecord,
@@ -27,6 +29,7 @@ import {
   speakerSpeedPath,
   speakerStatePath,
   updateSpeakerState,
+  watchPlaybackSpeed,
   writeSpeakerRecord,
   writeSpeakerState,
   type ProcessDescription,
@@ -139,6 +142,8 @@ class FakePlayback implements SpeakerPlayback {
   readonly speeds: number[] = [];
   /** Every setPaused the daemon drove, in order. */
   readonly pausedCalls: boolean[] = [];
+  /** Every live retune the daemon pushed at audio already playing, in order. */
+  readonly liveSpeeds: number[] = [];
   cancelCount = 0;
   private pending?: (error: unknown) => void;
   private readonly hold: boolean;
@@ -158,6 +163,11 @@ class FakePlayback implements SpeakerPlayback {
 
   resume(): Promise<void> {
     this.pausedCalls.push(false);
+    return Promise.resolve();
+  }
+
+  setSpeed(speed: number): Promise<void> {
+    this.liveSpeeds.push(speed);
     return Promise.resolve();
   }
 
@@ -211,6 +221,8 @@ function harness(overrides: Partial<SpeakerEnvironment> = {}): Harness {
     createPlayback: () => {
       throw new Error("createPlayback was not stubbed");
     },
+    // Tests that care about live speed override this; the rest run unwatched.
+    watchDirectory: () => undefined,
   };
 
   return {
@@ -232,6 +244,38 @@ function waitFor(predicate: () => boolean, timeoutMs = 250): Promise<void> {
     };
     check();
   });
+}
+
+/**
+ * A speed watch the test drives by hand: `fire` stands in for a filesystem
+ * event, so nothing here depends on real inotify/FSEvents timing.
+ */
+function speedWatchHarness(overrides: Partial<SpeakerEnvironment> = {}) {
+  let listener: ((fileName: string | undefined) => void) | undefined;
+  let watchedDirectory: string | undefined;
+  let stopped = 0;
+
+  const base = harness({
+    watchDirectory: (directory, onChange) => {
+      watchedDirectory = directory;
+      listener = onChange;
+      return () => {
+        stopped += 1;
+      };
+    },
+    ...overrides,
+  });
+
+  return {
+    ...base,
+    fire: (fileName: string | undefined = SPEED_FILE_NAME) => listener?.(fileName),
+    get watchedDirectory(): string | undefined {
+      return watchedDirectory;
+    },
+    get stopped(): number {
+      return stopped;
+    },
+  };
 }
 
 test("the teardown ladder mirrors the speech engine grace periods", () => {
@@ -443,6 +487,110 @@ test("a speed written mid-utterance lands on the next chunk", async () => {
     speeds.slice(1).every((speed) => speed === 2.5),
     `expected every later chunk at 2.50, got ${speeds.join(", ")}`,
   );
+});
+
+test("a valid speed written mid-chunk retunes the audio already playing", () => {
+  const applied: number[] = [];
+  const watch = speedWatchHarness();
+  const stop = watchPlaybackSpeed(watch.environment, STATE_DIR, 1.25, (speed) => applied.push(speed));
+
+  watch.files.writeText(speakerSpeedPath(STATE_DIR), "2.50\n");
+  // One save fires several filesystem events; the retune must not stutter.
+  watch.fire();
+  watch.fire();
+
+  assert.deepEqual(applied, [2.5]);
+  assert.equal(watch.watchedDirectory, STATE_DIR);
+
+  stop();
+  assert.equal(watch.stopped, 1);
+});
+
+test("garbage, a repeat, and a removed speed file all leave the live audio alone", () => {
+  const applied: number[] = [];
+  const watch = speedWatchHarness();
+  watchPlaybackSpeed(watch.environment, STATE_DIR, 1.25, (speed) => applied.push(speed));
+
+  for (const garbage of ["", "   ", "fast", "9.00", "0.10", "1.5 2.5"]) {
+    watch.files.writeText(speakerSpeedPath(STATE_DIR), garbage);
+    watch.fire();
+  }
+  assert.deepEqual(applied, [], "a half-written file must never reach the player");
+
+  watch.files.writeText(speakerSpeedPath(STATE_DIR), "1.25");
+  watch.fire();
+  assert.deepEqual(applied, [], "the speed already in effect is not re-sent");
+
+  watch.files.writeText(speakerSpeedPath(STATE_DIR), "2.00");
+  watch.fire();
+  watch.files.remove(speakerSpeedPath(STATE_DIR));
+  watch.fire();
+  assert.deepEqual(applied, [2], "removal falls back at the next chunk rather than lurching this one");
+});
+
+test("the speed watch ignores its neighbours in the state dir", () => {
+  const applied: number[] = [];
+  const watch = speedWatchHarness();
+  watchPlaybackSpeed(watch.environment, STATE_DIR, 1.25, (speed) => applied.push(speed));
+
+  watch.files.writeText(speakerSpeedPath(STATE_DIR), "2.50");
+  watch.fire(STATE_FILE_NAME);
+  assert.deepEqual(applied, []);
+
+  // Platforms that omit the entry name cost a re-read, never a missed change.
+  watch.fire(undefined);
+  assert.deepEqual(applied, [2.5]);
+});
+
+test("a refused watch leaves the per-chunk reader as the only channel", () => {
+  const applied: number[] = [];
+  const { environment } = harness({ watchDirectory: () => undefined });
+
+  const stop = watchPlaybackSpeed(environment, STATE_DIR, 1.25, (speed) => applied.push(speed));
+
+  assert.doesNotThrow(stop);
+  assert.deepEqual(applied, []);
+});
+
+test("the daemon retunes playing audio from the speed file and stops watching when it exits", async () => {
+  const playback = new FakePlayback(true);
+  const signals = new EventEmitter();
+  const watch = speedWatchHarness({
+    stdin: Readable.from(["A long answer that is still playing."]),
+    env: { PI_TALK_SPEED: "1.25" },
+    signals,
+    createPlayback: () => playback,
+  });
+
+  const pending = runSpeakerCli(["--daemon"], watch.environment);
+  await waitFor(() => playback.spoken.length === 1);
+  assert.deepEqual(playback.speeds, [1.25]);
+
+  watch.files.writeText(speakerSpeedPath(STATE_DIR), "2.50\n");
+  watch.fire();
+  await waitFor(() => playback.liveSpeeds.length === 1);
+  assert.deepEqual(playback.liveSpeeds, [2.5]);
+
+  signals.emit("SIGTERM");
+  assert.equal(await pending, 0);
+  assert.equal(watch.stopped, 1);
+});
+
+test("a daemon whose watch is refused still speaks at the per-chunk speed", async () => {
+  const playback = new FakePlayback();
+  const { environment, files, probe } = harness({
+    stdin: Readable.from(["Speed check."]),
+    env: { PI_TALK_SPEED: "1.75" },
+    createPlayback: () => playback,
+    watchDirectory: () => undefined,
+  });
+  files.writeText(speakerSpeedPath(STATE_DIR), "2.25\n");
+  probe.add(777, { pgid: 777 });
+
+  assert.equal(await runSpeakerCli(["--daemon"], environment), 0);
+
+  assert.deepEqual(playback.speeds, [2.25]);
+  assert.deepEqual(playback.liveSpeeds, []);
 });
 
 test("--file reads the request, unlinks it, and hands the text to a detached daemon", async () => {

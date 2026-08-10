@@ -412,6 +412,104 @@ test("pause and resume use mpv IPC without suspending the player process", async
   assert.deepEqual(players[0].signals, ["SIGTERM"]);
 });
 
+test("setSpeed retunes the playing audio over the same IPC channel", async () => {
+  const players: FakePlayer[] = [];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1]));
+    },
+  });
+  const playback = playbackWith(async () => new Response(body), players);
+
+  const pending = playback.playChunk("hello", 1.25);
+  await waitFor(() => players.length === 1);
+  await playback.setSpeed(2.5);
+
+  assert.deepEqual(players[0].commands, [["set_property", "speed", 2.5]]);
+  assert.deepEqual(players[0].signals, []);
+
+  await playback.cancel();
+  await assert.rejects(pending, SpeechCancelledError);
+});
+
+test("setSpeed clamps to the supported range and ignores a non-finite rate", async () => {
+  const players: FakePlayer[] = [];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1]));
+    },
+  });
+  const playback = playbackWith(async () => new Response(body), players);
+
+  const pending = playback.playChunk("hello", 1);
+  await waitFor(() => players.length === 1);
+  await playback.setSpeed(9);
+  await playback.setSpeed(0.1);
+  await playback.setSpeed(1.333);
+  await playback.setSpeed(Number.NaN);
+
+  assert.deepEqual(players[0].commands, [
+    ["set_property", "speed", 3],
+    ["set_property", "speed", 0.5],
+    ["set_property", "speed", 1.33],
+  ]);
+
+  await playback.cancel();
+  await assert.rejects(pending, SpeechCancelledError);
+});
+
+test("setSpeed is silent when nothing is playing", async () => {
+  const players: FakePlayer[] = [];
+  const playback = playbackWith(async () => new Response(new ReadableStream<Uint8Array>()), players);
+
+  await playback.setSpeed(2);
+
+  assert.equal(players.length, 0);
+  assert.equal(playback.hasActivePlayback, false);
+});
+
+test("a failed setSpeed is sanitized and stops playback safely", async () => {
+  const players: FakePlayer[] = [];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1]));
+    },
+  });
+  const playback = playbackWith(async () => new Response(body), players, { ipcErrorOnce: true });
+
+  const pending = playback.playChunk("hello", 1);
+  void pending.catch(() => undefined);
+  await waitFor(() => players.length === 1);
+  await assert.rejects(
+    playback.setSpeed(2),
+    (error) =>
+      error instanceof SpeechError && error.code === "playback" && !error.message.includes("property unavailable"),
+  );
+  await assert.rejects(pending, (error) => error instanceof SpeechError && error.code === "playback");
+  assert.equal(players[0].control.destroyed, true);
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
+});
+
+test("a setSpeed timeout is sanitized and stops playback safely", async () => {
+  const players: FakePlayer[] = [];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1]));
+    },
+  });
+  const playback = playbackWith(async () => new Response(body), players, { ignoreIpc: true }, { controlMs: 5 });
+
+  const pending = playback.playChunk("hello", 1);
+  void pending.catch(() => undefined);
+  await waitFor(() => players.length === 1);
+  await assert.rejects(
+    playback.setSpeed(2),
+    (error) => error instanceof SpeechError && error.code === "playback" && !error.message.includes("timed out"),
+  );
+  await assert.rejects(pending, (error) => error instanceof SpeechError && error.code === "playback");
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
+});
+
 test("mpv control failures are sanitized and stop playback safely", async () => {
   const players: FakePlayer[] = [];
   const body = new ReadableStream<Uint8Array>({
