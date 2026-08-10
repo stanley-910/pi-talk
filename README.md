@@ -84,7 +84,13 @@ npm test
 echo "Some prose to read aloud." | bin/cc-talk-speak
 bin/cc-talk-speak --file /tmp/response.txt   # the file is deleted after it is read
 bin/cc-talk-speak --stop                     # always exits 0, even with nothing playing
+bin/cc-talk-speak --pause                    # freeze at the current position
+bin/cc-talk-speak --unpause                  # continue from where it froze
 ```
+
+Input is markdown, and it is cleaned exactly the way the extension cleans an assistant message: fenced code blocks are silent, inline code inside prose is spoken, and math, link targets, URLs, and markdown punctuation are dropped. Both paths call the same `src/clean.ts`, so what Pi speaks and what the CLI speaks cannot drift.
+
+`--pause` and `--unpause` signal the recorded daemon pid alone — `SIGUSR1` and `SIGUSR2` — so `mpv` freezes at its exact position instead of dying. Both exit 0 when nothing is playing. A paused speaker is still an ordinary speaker: `--stop` and a newer speaker's takeover both terminate it.
 
 The CLI reads its text, then respawns itself detached so the caller returns immediately. The daemon leads its own process group, which the `mpv` it spawns joins, so a single group signal reaches both and no orphaned player survives.
 
@@ -166,6 +172,8 @@ Live tests call OpenAI and incur API cost. Run them only when intended.
 - rejection of overlapping playback;
 - LaTeX removal without swallowing ordinary currency prose;
 - speaker-CLI pidfile takeover, including reused and dead pids, and `--stop` ladder escalation;
+- shared markdown cleaning: fence stripping, inline code survival, and math stripped exactly once;
+- `--pause`/`--unpause` signalling the daemon pid alone, idempotent on a stale pidfile, and still killable;
 - `--file` unlinking, detached daemon handoff, and `SIGTERM` graceful cancel;
 - `~/.secrets/env` key fallback, speed bounds, and sanitized speaker-log lines.
 

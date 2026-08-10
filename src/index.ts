@@ -11,6 +11,7 @@ import {
   registerPiTalkShortcuts,
   type SpeechMode,
 } from "./controls.ts";
+import { cleanForSpeech, stripFencedCode } from "./clean.ts";
 import {
   OPENAI_SPEECH_MODEL,
   OPENAI_SPEECH_VOICE,
@@ -18,7 +19,6 @@ import {
   SpeechCancelledError,
   SpeechError,
   splitSpeechText,
-  stripDelimitedMath,
 } from "./speech.ts";
 
 const STATUS_ID = "pi-talk";
@@ -192,52 +192,6 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
 
   function resetAccumulator() {
     state.messageMarkdown = "";
-  }
-
-  function stripFencedCode(markdown: string): string {
-    let fence: { marker: "`" | "~"; length: number } | undefined;
-    const prose: string[] = [];
-
-    for (const line of markdown.split(/\r?\n/)) {
-      const indent = line.match(/^ */)?.[0].length ?? 0;
-      const candidate = indent <= 3 ? line.slice(indent) : "";
-      const run = candidate.match(/^(`+|~+)/)?.[0];
-
-      if (!fence) {
-        if (run && run.length >= 3) {
-          fence = { marker: run[0] as "`" | "~", length: run.length };
-        } else {
-          prose.push(line);
-        }
-        continue;
-      }
-
-      if (
-        run &&
-        run[0] === fence.marker &&
-        run.length >= fence.length &&
-        candidate.slice(run.length).trim() === ""
-      ) {
-        fence = undefined;
-      }
-    }
-
-    return prose.join("\n");
-  }
-
-  function cleanForSpeech(text: string): string {
-    return stripDelimitedMath(text)
-      .replace(/\\begin\{([^}]+)}[\s\S]*?\\end\{\1}/g, " ")
-      .replace(/\[([^\]]+)]\([^)]*\)/g, "$1")
-      .replace(/(`+)([^`\n]+)\1/g, "$2")
-      .replace(/https?:\/\/\S+/g, "")
-      .replace(/^\s{0,3}(?:#{1,6}|[-*+] |\d+[.)] )/gm, "")
-      .replace(/[>*_~]/g, "")
-      .replace(/(^|\s)[,;:]+(?=\s|$)/g, "$1")
-      .replace(/\b(?:and|or)\s+(?=[.!?](?:\s|$))/gi, "")
-      .replace(/\s+([.!?])/g, "$1")
-      .replace(/\s+/g, " ")
-      .trim();
   }
 
   function captureUtterance(text: string) {

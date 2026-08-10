@@ -7,12 +7,12 @@ import type { ChildProcess } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import type { Readable } from "node:stream";
 import { DEFAULT_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED, MIN_PLAYBACK_SPEED } from "./controls.ts";
+import { cleanMarkdownForSpeech } from "./clean.ts";
 import {
   OpenAISpeechPlayback,
   SpeechCancelledError,
   SpeechError,
   splitSpeechText,
-  stripDelimitedMath,
 } from "./speech.ts";
 
 /** Substring every speaker command line carries, used to reject reused pids. */
@@ -27,9 +27,15 @@ export const TERM_GRACE_MS = 250;
 export const KILL_GRACE_MS = 1_000;
 const LIVENESS_POLL_MS = 10;
 
+/** Sent to the daemon pid alone: mpv must stay alive, merely frozen. */
+export const PAUSE_SIGNAL: NodeJS.Signals = "SIGUSR1";
+export const RESUME_SIGNAL: NodeJS.Signals = "SIGUSR2";
+
 const USAGE = `Usage:
   cc-talk-speak [--file <path>]   speak text from <path> (deleted after reading) or stdin
   cc-talk-speak --stop            stop the current speaker
+  cc-talk-speak --pause           freeze the current speaker at its position
+  cc-talk-speak --unpause         continue a frozen speaker
   cc-talk-speak --help            show this message
 
 Environment:
@@ -67,6 +73,8 @@ export type ProcessProbe = {
   isAlive(pid: number): boolean;
   describe(pid: number): ProcessDescription | undefined;
   signalGroup(pgid: number, signal: NodeJS.Signals): void;
+  /** Signals one process. Pause/resume use this so mpv stays alive, merely frozen. */
+  signalProcess(pid: number, signal: NodeJS.Signals): void;
 };
 
 export type SpeakerFileSystem = {
@@ -80,6 +88,9 @@ export type SpeakerFileSystem = {
 export type SpeakerPlayback = {
   playChunk(text: string, playbackSpeed: number): Promise<void>;
   cancel(): Promise<void>;
+  /** Exact-position freeze; absent on players that cannot pause. */
+  pause?(): Promise<void>;
+  resume?(): Promise<void>;
 };
 
 export type SpeakerEnvironment = {
@@ -155,6 +166,14 @@ export function defaultProcessProbe(): ProcessProbe {
         process.kill(-pgid, signal);
       } catch {
         // The group is already gone; supersession is still satisfied.
+      }
+    },
+    signalProcess(pid, signal) {
+      if (!Number.isInteger(pid) || pid <= 1) return;
+      try {
+        process.kill(pid, signal);
+      } catch {
+        // The speaker is already gone; pause and unpause are idempotent.
       }
     },
   };
@@ -350,6 +369,23 @@ export async function stopSpeaker(environment: SpeakerEnvironment, stateDir: str
   clearSpeakerRecord(stateDir, environment.files, record.pid);
 }
 
+/**
+ * Signals the recorded daemon — the pid only, never the group, so the player it
+ * spawned survives. Returns whether a live speaker was there to receive it;
+ * a missing, stale, or reused pidfile is a silent no-op.
+ */
+export function signalSpeaker(
+  environment: SpeakerEnvironment,
+  stateDir: string,
+  signal: NodeJS.Signals,
+): boolean {
+  const record = readSpeakerRecord(stateDir, environment.files);
+  if (!record || !isSpeakerRecordLive(record, environment.probe)) return false;
+
+  environment.probe.signalProcess(record.pid, signal);
+  return true;
+}
+
 /** Never returns provider bodies, spoken text, paths, or key material. */
 export function sanitizeFailure(error: unknown): string {
   if (error instanceof SpeechError) return `${error.code}: ${error.userMessage}`;
@@ -373,7 +409,8 @@ export async function speakText(
   playbackSpeed: number,
   isCancelled: () => boolean = () => false,
 ): Promise<void> {
-  const chunks = splitSpeechText(stripDelimitedMath(text));
+  // cleanMarkdownForSpeech already applies stripDelimitedMath; do not repeat it.
+  const chunks = splitSpeechText(cleanMarkdownForSpeech(text));
   for (const chunk of chunks) {
     if (isCancelled()) return;
     await playback.playChunk(chunk, playbackSpeed);
@@ -414,7 +451,17 @@ async function runDaemon(environment: SpeakerEnvironment, stateDir: string): Pro
     cancelled = true;
     void playback?.cancel().catch(() => undefined);
   };
+  // Pause and unpause are position-preserving, so they never set `cancelled`:
+  // the daemon stays alive holding the pidfile and a frozen player.
+  const onPause = () => {
+    void playback?.pause?.().catch(() => undefined);
+  };
+  const onResume = () => {
+    void playback?.resume?.().catch(() => undefined);
+  };
   environment.signals.once("SIGTERM", onTerminate);
+  environment.signals.on(PAUSE_SIGNAL, onPause);
+  environment.signals.on(RESUME_SIGNAL, onResume);
 
   try {
     const apiKey = resolveApiKey(environment.env, () => environment.files.readText(secretsPath(environment.env)));
@@ -428,6 +475,8 @@ async function runDaemon(environment: SpeakerEnvironment, stateDir: string): Pro
     return 1;
   } finally {
     environment.signals.removeListener("SIGTERM", onTerminate);
+    environment.signals.removeListener(PAUSE_SIGNAL, onPause);
+    environment.signals.removeListener(RESUME_SIGNAL, onResume);
     clearSpeakerRecord(stateDir, environment.files, environment.pid);
   }
 }
@@ -447,6 +496,16 @@ export async function runSpeakerCli(
 
     if (argv.includes("--stop")) {
       await stopSpeaker(environment, stateDir);
+      return 0;
+    }
+
+    if (argv.includes("--pause")) {
+      signalSpeaker(environment, stateDir, PAUSE_SIGNAL);
+      return 0;
+    }
+
+    if (argv.includes("--unpause")) {
+      signalSpeaker(environment, stateDir, RESUME_SIGNAL);
       return 0;
     }
 
