@@ -14,6 +14,7 @@ import {
   isSpeakerRecordLive,
   parseSecretsEnv,
   readSpeakerRecord,
+  readSpeakerState,
   resolveApiKey,
   resolvePlaybackSpeed,
   runSpeakerCli,
@@ -22,7 +23,10 @@ import {
   speakText,
   speakerLogPath,
   speakerPidPath,
+  speakerStatePath,
+  updateSpeakerState,
   writeSpeakerRecord,
+  writeSpeakerState,
   type ProcessDescription,
   type ProcessProbe,
   type SpeakerEnvironment,
@@ -694,6 +698,100 @@ test("--help lists the pause verbs", async () => {
   assert.equal(await runSpeakerCli(["--help"], environment), 0);
   assert.match(stdout.join(""), /--pause\s+freeze the current speaker/);
   assert.match(stdout.join(""), /--unpause\s+continue a frozen speaker/);
+});
+
+test("the state file follows playback from start through pause and resume to exit", async () => {
+  const playback = new FakePlayback(true);
+  const signals = new EventEmitter();
+  const { environment, files } = harness({
+    stdin: Readable.from(["A long answer that is still playing."]),
+    signals,
+    createPlayback: () => playback,
+  });
+
+  const pending = runSpeakerCli(["--daemon"], environment);
+  await waitFor(() => playback.spoken.length === 1);
+  assert.equal(readSpeakerState(STATE_DIR, files), "playing");
+
+  signals.emit(PAUSE_SIGNAL);
+  await waitFor(() => playback.paused);
+  assert.equal(readSpeakerState(STATE_DIR, files), "paused");
+
+  signals.emit(RESUME_SIGNAL);
+  await waitFor(() => !playback.paused);
+  assert.equal(readSpeakerState(STATE_DIR, files), "playing");
+
+  signals.emit("SIGTERM");
+  assert.equal(await pending, 0);
+  assert.equal(files.entries.has(speakerStatePath(STATE_DIR)), false);
+});
+
+test("a daemon that finishes its answer leaves no state file behind", async () => {
+  const playback = new FakePlayback();
+  const { environment, files, probe } = harness({
+    stdin: Readable.from(["Short answer."]),
+    createPlayback: () => playback,
+  });
+  probe.add(777, { pgid: 777 });
+
+  assert.equal(await runSpeakerCli(["--daemon"], environment), 0);
+  assert.equal(files.entries.has(speakerStatePath(STATE_DIR)), false);
+});
+
+test("--stop clears the state file alongside the pidfile", async () => {
+  const { environment, files, probe } = harness();
+  writeSpeakerRecord(STATE_DIR, files, { pid: 4_242, pgid: 4_242, startedAt: 1 });
+  writeSpeakerState(STATE_DIR, files, "paused");
+  probe.add(4_242);
+
+  assert.equal(await runSpeakerCli(["--stop"], environment), 0);
+  assert.equal(files.entries.has(speakerStatePath(STATE_DIR)), false);
+});
+
+test("a takeover replaces a paused state with the newcomer's playing", async () => {
+  const { environment, files, probe } = harness();
+  writeSpeakerRecord(STATE_DIR, files, { pid: 4_242, pgid: 4_242, startedAt: 1 });
+  writeSpeakerState(STATE_DIR, files, "paused");
+  probe.add(4_242);
+  probe.add(777);
+
+  await claimSpeaker(environment, STATE_DIR);
+
+  assert.equal(readSpeakerRecord(STATE_DIR, files)?.pid, 777);
+  assert.equal(readSpeakerState(STATE_DIR, files), "playing");
+});
+
+test("a departing speaker never deletes a newer speaker's state file", () => {
+  const { files } = harness();
+  writeSpeakerRecord(STATE_DIR, files, { pid: 999, pgid: 999, startedAt: 2 });
+  writeSpeakerState(STATE_DIR, files, "paused");
+
+  clearSpeakerRecord(STATE_DIR, files, 777);
+  assert.equal(readSpeakerState(STATE_DIR, files), "paused");
+
+  clearSpeakerRecord(STATE_DIR, files, 999);
+  assert.equal(readSpeakerState(STATE_DIR, files), undefined);
+});
+
+test("a stale daemon never rewrites the state a newer speaker owns", () => {
+  const { files } = harness();
+  writeSpeakerRecord(STATE_DIR, files, { pid: 999, pgid: 999, startedAt: 2 });
+  writeSpeakerState(STATE_DIR, files, "playing");
+
+  updateSpeakerState(STATE_DIR, files, 777, "paused");
+  assert.equal(readSpeakerState(STATE_DIR, files), "playing");
+
+  updateSpeakerState(STATE_DIR, files, 999, "paused");
+  assert.equal(readSpeakerState(STATE_DIR, files), "paused");
+});
+
+test("a corrupt state file reads as unknown rather than as paused", () => {
+  const { files } = harness();
+  files.writeText(speakerStatePath(STATE_DIR), "half-written garb");
+  assert.equal(readSpeakerState(STATE_DIR, files), undefined);
+
+  files.writeText(speakerStatePath(STATE_DIR), "  paused \n");
+  assert.equal(readSpeakerState(STATE_DIR, files), "paused");
 });
 
 test("signalSpeaker reports whether a live speaker received the signal", () => {

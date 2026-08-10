@@ -19,6 +19,7 @@ import {
 export const SPEAKER_MARKER = "cc-talk-speak";
 export const SPEAKER_STATE_DIR_ENV = "CC_TALK_STATE_DIR";
 export const PID_FILE_NAME = "speaker.pid";
+export const STATE_FILE_NAME = "state";
 export const LOG_FILE_NAME = "speaker.log";
 export const SECRETS_FILE_NAME = ".secrets/env";
 
@@ -63,6 +64,8 @@ export type SpeakerRecord = {
   pgid: number;
   startedAt: number;
 };
+
+export type SpeakerPlaybackState = "playing" | "paused";
 
 export type ProcessDescription = {
   pgid: number;
@@ -216,6 +219,10 @@ export function speakerPidPath(stateDir: string): string {
   return join(stateDir, PID_FILE_NAME);
 }
 
+export function speakerStatePath(stateDir: string): string {
+  return join(stateDir, STATE_FILE_NAME);
+}
+
 export function speakerLogPath(stateDir: string): string {
   return join(stateDir, LOG_FILE_NAME);
 }
@@ -295,11 +302,46 @@ export function writeSpeakerRecord(stateDir: string, files: SpeakerFileSystem, r
   files.writeText(speakerPidPath(stateDir), `${JSON.stringify(record)}\n`);
 }
 
-/** Deletes the pidfile only while it still names `pid`, so a newer speaker survives. */
+/**
+ * Deletes the pidfile only while it still names `pid`, so a newer speaker
+ * survives. The state file rides along: it describes whatever the pidfile
+ * points at, so the two are always created and destroyed together.
+ */
 export function clearSpeakerRecord(stateDir: string, files: SpeakerFileSystem, pid: number): void {
   const current = readSpeakerRecord(stateDir, files);
   if (current && current.pid !== pid) return;
   files.remove(speakerPidPath(stateDir));
+  files.remove(speakerStatePath(stateDir));
+}
+
+/**
+ * Whether the speaker is mid-sentence or frozen. Readers outside this process
+ * (the `talk cycle` keybinding) need it to pick pause vs unpause, and a signal
+ * carries no payload to ask with.
+ */
+export function readSpeakerState(stateDir: string, files: SpeakerFileSystem): SpeakerPlaybackState | undefined {
+  const contents = files.readText(speakerStatePath(stateDir))?.trim();
+  return contents === "playing" || contents === "paused" ? contents : undefined;
+}
+
+export function writeSpeakerState(stateDir: string, files: SpeakerFileSystem, state: SpeakerPlaybackState): void {
+  files.ensureDirectory(stateDir);
+  files.writeText(speakerStatePath(stateDir), `${state}\n`);
+}
+
+/**
+ * Records a pause/resume transition, but only while the pidfile still names
+ * `pid`. A daemon that has already lost the speaker to a newcomer must not
+ * describe the newcomer's playback.
+ */
+export function updateSpeakerState(
+  stateDir: string,
+  files: SpeakerFileSystem,
+  pid: number,
+  state: SpeakerPlaybackState,
+): void {
+  if (readSpeakerRecord(stateDir, files)?.pid !== pid) return;
+  writeSpeakerState(stateDir, files, state);
 }
 
 /**
@@ -355,6 +397,9 @@ export async function claimSpeaker(environment: SpeakerEnvironment, stateDir: st
   const pgid = environment.probe.describe(environment.pid)?.pgid ?? environment.pid;
   const record: SpeakerRecord = { pid: environment.pid, pgid, startedAt: environment.now() };
   writeSpeakerRecord(stateDir, environment.files, record);
+  // A fresh claim is always mid-sentence; any pause the previous speaker
+  // recorded died with it.
+  writeSpeakerState(stateDir, environment.files, "playing");
   return record;
 }
 
@@ -454,9 +499,11 @@ async function runDaemon(environment: SpeakerEnvironment, stateDir: string): Pro
   // Pause and unpause are position-preserving, so they never set `cancelled`:
   // the daemon stays alive holding the pidfile and a frozen player.
   const onPause = () => {
+    updateSpeakerState(stateDir, environment.files, environment.pid, "paused");
     void playback?.pause?.().catch(() => undefined);
   };
   const onResume = () => {
+    updateSpeakerState(stateDir, environment.files, environment.pid, "playing");
     void playback?.resume?.().catch(() => undefined);
   };
   environment.signals.once("SIGTERM", onTerminate);
