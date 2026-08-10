@@ -7,12 +7,12 @@ import type { ChildProcess } from "node:child_process";
 import type { EventEmitter } from "node:events";
 import type { Readable } from "node:stream";
 import { DEFAULT_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED, MIN_PLAYBACK_SPEED } from "./controls.ts";
+import { cleanMarkdownForSpeech } from "./clean.ts";
 import {
   OpenAISpeechPlayback,
   SpeechCancelledError,
   SpeechError,
   splitSpeechText,
-  stripDelimitedMath,
 } from "./speech.ts";
 
 /** Substring every speaker command line carries, used to reject reused pids. */
@@ -373,7 +373,8 @@ export async function speakText(
   playbackSpeed: number,
   isCancelled: () => boolean = () => false,
 ): Promise<void> {
-  const chunks = splitSpeechText(stripDelimitedMath(text));
+  // cleanMarkdownForSpeech already applies stripDelimitedMath; do not repeat it.
+  const chunks = splitSpeechText(cleanMarkdownForSpeech(text));
   for (const chunk of chunks) {
     if (isCancelled()) return;
     await playback.playChunk(chunk, playbackSpeed);

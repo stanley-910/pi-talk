@@ -86,6 +86,8 @@ bin/cc-talk-speak --file /tmp/response.txt   # the file is deleted after it is r
 bin/cc-talk-speak --stop                     # always exits 0, even with nothing playing
 ```
 
+Input is markdown, and it is cleaned exactly the way the extension cleans an assistant message: fenced code blocks are silent, inline code inside prose is spoken, and math, link targets, URLs, and markdown punctuation are dropped. Both paths call the same `src/clean.ts`, so what Pi speaks and what the CLI speaks cannot drift.
+
 The CLI reads its text, then respawns itself detached so the caller returns immediately. The daemon leads its own process group, which the `mpv` it spawns joins, so a single group signal reaches both and no orphaned player survives.
 
 Speaker state lives in `~/.claude/cc-talk/` (override with `CC_TALK_STATE_DIR`):
@@ -166,6 +168,7 @@ Live tests call OpenAI and incur API cost. Run them only when intended.
 - rejection of overlapping playback;
 - LaTeX removal without swallowing ordinary currency prose;
 - speaker-CLI pidfile takeover, including reused and dead pids, and `--stop` ladder escalation;
+- shared markdown cleaning: fence stripping, inline code survival, and math stripped exactly once;
 - `--file` unlinking, detached daemon handoff, and `SIGTERM` graceful cancel;
 - `~/.secrets/env` key fallback, speed bounds, and sanitized speaker-log lines.
 

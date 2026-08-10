@@ -423,7 +423,7 @@ test("the daemon claims the speaker, speaks every chunk, then releases the pidfi
 
   assert.equal(await runSpeakerCli(["--daemon"], environment), 0);
 
-  assert.deepEqual(playback.spoken, ["Alpha.   Omega."]);
+  assert.deepEqual(playback.spoken, ["Alpha. Omega."]);
   assert.deepEqual(playback.speeds, [1.75]);
   assert.equal(files.entries.has(speakerPidPath(STATE_DIR)), false);
   assert.equal(files.entries.has(speakerLogPath(STATE_DIR)), false);
@@ -541,6 +541,36 @@ test("speakText strips math, orders chunks, and stops once cancelled", async () 
     () => cancelled,
   );
   assert.equal(stopping.spoken.length, 1);
+});
+
+test("the speaker path never speaks fenced code, URLs, or markdown syntax", async () => {
+  const playback = new FakePlayback();
+  const markdown = [
+    "Here is the **fix**:",
+    "```typescript",
+    "async function teardown() {",
+    "  await player.kill();",
+    "}",
+    "```",
+    "Call `teardown()` first.",
+  ].join("\n");
+
+  await speakText(markdown, playback, 1.25);
+
+  assert.deepEqual(playback.spoken, ["Here is the fix: Call teardown() first."]);
+});
+
+test("the daemon speaks the same cleaned text the Pi extension would", async () => {
+  const playback = new FakePlayback();
+  const { environment, probe } = harness({
+    stdin: Readable.from(["## Notes\n\n```sh\nrm -rf /\n```\n\nSee https://example.com/x for details."]),
+    createPlayback: () => playback,
+  });
+  probe.add(777, { pgid: 777 });
+
+  assert.equal(await runSpeakerCli(["--daemon"], environment), 0);
+
+  assert.deepEqual(playback.spoken, ["Notes See for details."]);
 });
 
 test("unknown errors never leak their message into the log", () => {
