@@ -20,6 +20,7 @@ export const SPEAKER_MARKER = "cc-talk-speak";
 export const SPEAKER_STATE_DIR_ENV = "CC_TALK_STATE_DIR";
 export const PID_FILE_NAME = "speaker.pid";
 export const STATE_FILE_NAME = "state";
+export const SPEED_FILE_NAME = "speed";
 export const LOG_FILE_NAME = "speaker.log";
 export const SECRETS_FILE_NAME = ".secrets/env";
 
@@ -42,6 +43,10 @@ const USAGE = `Usage:
 Environment:
   OPENAI_API_KEY   required; falls back to ~/.secrets/env
   PI_TALK_SPEED    playback speed, ${MIN_PLAYBACK_SPEED.toFixed(2)}-${MAX_PLAYBACK_SPEED.toFixed(2)} (default ${DEFAULT_PLAYBACK_SPEED.toFixed(2)})
+
+Files:
+  <state dir>/${SPEED_FILE_NAME}   plain decimal speed, re-read before every chunk;
+                   outranks PI_TALK_SPEED, delete it to fall back (\`talk speed reset\`)
 `;
 
 export type SpeakerErrorCode = "usage" | "configuration" | "input" | "unexpected";
@@ -227,6 +232,10 @@ export function speakerLogPath(stateDir: string): string {
   return join(stateDir, LOG_FILE_NAME);
 }
 
+export function speakerSpeedPath(stateDir: string): string {
+  return join(stateDir, SPEED_FILE_NAME);
+}
+
 export function secretsPath(env: NodeJS.ProcessEnv): string {
   return join(env.HOME?.trim() || homedir(), SECRETS_FILE_NAME);
 }
@@ -267,14 +276,50 @@ export function resolveApiKey(env: NodeJS.ProcessEnv, readSecrets: () => string 
   );
 }
 
-export function resolvePlaybackSpeed(env: NodeJS.ProcessEnv): number {
-  const raw = env.PI_TALK_SPEED?.trim();
-  if (!raw) return DEFAULT_PLAYBACK_SPEED;
+/** A speed only counts when it is a finite number inside the supported range. */
+function parsePlaybackSpeed(raw: string | undefined): number | undefined {
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
 
-  const configured = Number(raw);
+  const configured = Number(trimmed);
   return Number.isFinite(configured) && configured >= MIN_PLAYBACK_SPEED && configured <= MAX_PLAYBACK_SPEED
     ? configured
-    : DEFAULT_PLAYBACK_SPEED;
+    : undefined;
+}
+
+export function resolvePlaybackSpeed(env: NodeJS.ProcessEnv): number {
+  return parsePlaybackSpeed(env.PI_TALK_SPEED) ?? DEFAULT_PLAYBACK_SPEED;
+}
+
+/**
+ * The speed knob `talk speed` turns. There is no IPC into a running daemon, so
+ * the file is the channel: the daemon re-reads it before every chunk and the
+ * newest value lands on the next one — a mid-utterance change costs one chunk
+ * of latency, never a restart.
+ *
+ * The file outranks `PI_TALK_SPEED`, which only seeds the daemon at spawn.
+ * Deleting the file (`talk speed reset`) falls back to that seed. Unreadable or
+ * out-of-range content is ignored so a half-written file cannot lurch playback:
+ * the last good speed stands.
+ */
+export function createSpeedReader(
+  stateDir: string,
+  files: SpeakerFileSystem,
+  spawnSpeed: number,
+): () => number {
+  let current = spawnSpeed;
+
+  return () => {
+    const contents = files.readText(speakerSpeedPath(stateDir));
+    if (contents === undefined) {
+      current = spawnSpeed;
+      return current;
+    }
+
+    const parsed = parsePlaybackSpeed(contents);
+    if (parsed !== undefined) current = parsed;
+    return current;
+  };
 }
 
 export function readSpeakerRecord(stateDir: string, files: SpeakerFileSystem): SpeakerRecord | undefined {
@@ -448,17 +493,21 @@ export function logSpeakerFailure(environment: SpeakerEnvironment, stateDir: str
   }
 }
 
+/**
+ * `resolveSpeed` is asked once per chunk rather than once per utterance, which
+ * is what lets `talk speed` reach a daemon that is already talking.
+ */
 export async function speakText(
   text: string,
   playback: SpeakerPlayback,
-  playbackSpeed: number,
+  resolveSpeed: () => number,
   isCancelled: () => boolean = () => false,
 ): Promise<void> {
   // cleanMarkdownForSpeech already applies stripDelimitedMath; do not repeat it.
   const chunks = splitSpeechText(cleanMarkdownForSpeech(text));
   for (const chunk of chunks) {
     if (isCancelled()) return;
-    await playback.playChunk(chunk, playbackSpeed);
+    await playback.playChunk(chunk, resolveSpeed());
   }
 }
 
@@ -514,7 +563,12 @@ async function runDaemon(environment: SpeakerEnvironment, stateDir: string): Pro
     const apiKey = resolveApiKey(environment.env, () => environment.files.readText(secretsPath(environment.env)));
     playback = environment.createPlayback(apiKey);
     if (cancelled) return 0;
-    await speakText(text, playback, resolvePlaybackSpeed(environment.env), () => cancelled);
+    const resolveSpeed = createSpeedReader(
+      stateDir,
+      environment.files,
+      resolvePlaybackSpeed(environment.env),
+    );
+    await speakText(text, playback, resolveSpeed, () => cancelled);
     return 0;
   } catch (error) {
     if (cancelled || error instanceof SpeechCancelledError) return 0;
