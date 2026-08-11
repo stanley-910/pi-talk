@@ -117,21 +117,37 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     );
   }
 
+  /**
+   * Retunes the audio that is already playing. Best-effort by design: a
+   * rejection means the player is gone, and the next chunk is spawned at
+   * `state.playbackSpeed` anyway, so a speed push must never raise an error
+   * toast at the user.
+   */
+  function pushLiveSpeed(speed: number) {
+    void state.playback?.setSpeed(speed).catch(() => {});
+  }
+
   function applyPlaybackSpeed(ctx: ExtensionContext, speed: number, reset = false) {
     state.playbackSpeed = clampPlaybackSpeed(speed);
     updateStatus();
+    pushLiveSpeed(state.playbackSpeed);
     const action = reset ? "reset" : "set";
-    notify(ctx, `Playback speed ${action} to ${formatPlaybackSpeed(state.playbackSpeed)} for the next utterance`);
+    const scope = state.mode === "talking" ? " (applies now)" : "";
+    notify(ctx, `Playback speed ${action} to ${formatPlaybackSpeed(state.playbackSpeed)}${scope}`);
   }
 
   async function openPlaybackSpeedControl(ctx: ExtensionContext) {
     const selected = await ctx.ui.custom<number | undefined>((tui, theme, keybindings, done) => {
       let draft = state.playbackSpeed;
 
-      const adjust = (delta: number) => {
-        draft = clampPlaybackSpeed(draft + delta);
+      // Every draft move previews audibly, so the slider is tuned by ear
+      // rather than by number. Cancelling restores the committed rate below.
+      const setDraft = (value: number) => {
+        draft = clampPlaybackSpeed(value);
+        pushLiveSpeed(draft);
         tui.requestRender();
       };
+      const adjust = (delta: number) => setDraft(draft + delta);
 
       return {
         render(width: number) {
@@ -152,7 +168,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
             "",
             theme.fg("muted", "j faster · k slower (0.10×) · Shift+j/k 0.05×"),
             theme.fg("muted", "←/→ also adjust · Space pause/unpause · r reset"),
-            theme.fg("muted", "Enter apply · Esc/Ctrl+C cancel · applies to next utterance"),
+            theme.fg("muted", "Enter apply · Esc/Ctrl+C cancel · preview is live"),
           ].map((line) => truncateToWidth(line, width));
         },
         invalidate() {},
@@ -167,22 +183,17 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
             if (state.mode === "talking") void setSpeechPaused(ctx, true).finally(() => tui.requestRender());
             else if (state.mode === "paused") void setSpeechPaused(ctx, false).finally(() => tui.requestRender());
             else notify(ctx, "Pi Talk is gagged; use /talk first", "warning");
-          } else if (matchesKey(data, Key.home)) {
-            draft = MIN_PLAYBACK_SPEED;
-            tui.requestRender();
-          } else if (matchesKey(data, Key.end)) {
-            draft = MAX_PLAYBACK_SPEED;
-            tui.requestRender();
-          } else if (data.toLowerCase() === "r") {
-            draft = DEFAULT_PLAYBACK_SPEED;
-            tui.requestRender();
-          } else if (matchesKey(data, Key.enter) || keybindings.matches(data, "tui.select.confirm")) done(draft);
+          } else if (matchesKey(data, Key.home)) setDraft(MIN_PLAYBACK_SPEED);
+          else if (matchesKey(data, Key.end)) setDraft(MAX_PLAYBACK_SPEED);
+          else if (data.toLowerCase() === "r") setDraft(DEFAULT_PLAYBACK_SPEED);
+          else if (matchesKey(data, Key.enter) || keybindings.matches(data, "tui.select.confirm")) done(draft);
           else if (matchesKey(data, Key.escape) || keybindings.matches(data, "tui.select.cancel")) done(undefined);
         },
       };
     });
 
     if (selected === undefined) {
+      pushLiveSpeed(state.playbackSpeed);
       notify(ctx, `Playback speed unchanged at ${formatPlaybackSpeed(state.playbackSpeed)}`);
       return;
     }
