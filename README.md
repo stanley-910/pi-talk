@@ -111,7 +111,7 @@ Node 23+ is required: the executable is plain JavaScript that imports the TypeSc
 /unpause       Continue from the exact paused position
 /gag           Stop audio, clear queued speech, and disable auto-speaking
 /speed         Open the keyboard playback-speed slider
-/speed 1.25    Set playback speed directly for the next chunk
+/speed 1.25    Set playback speed directly, retuning audio already playing
 /speed reset   Restore 1.25× playback
 /talk test     Activate Talking and play a short live OpenAI diagnostic
 /talk status   Show playback, queue, model, voice, and speed state
@@ -131,7 +131,7 @@ Speed shortcuts use the same `0.50×–3.00×` bounds as `/speed`. Use `/gag` to
 
 A newer assistant message interrupts stale audio while Talking. Pi Talk waits for the new message to finish, then speaks it. While Paused, automatic `message_start` preserves the exact position and backlog; `/talk` explicitly discards stale paused audio and starts the newest complete message from its beginning.
 
-The `/speed` slider uses `j` to speed up and `k` to slow down by `0.10×`, shifted `j`/`k` for `0.05×`, arrows for optional coarse control, Space to pause/unpause, `r` to reset, Enter to apply, and Escape or Ctrl+C to cancel. Outside the slider, `Ctrl+Shift+.` speeds up and `Ctrl+Shift+,` slows down by `0.10×`. Supported speed is `0.50×–3.00×`; changes apply to the next chunk through mpv's pitch-corrected playback speed, while active audio keeps its current rate.
+The `/speed` slider uses `j` to speed up and `k` to slow down by `0.10×`, shifted `j`/`k` for `0.05×`, arrows for optional coarse control, Space to pause/unpause, `r` to reset, Enter to apply, and Escape or Ctrl+C to cancel. Outside the slider, `Ctrl+Shift+.` speeds up and `Ctrl+Shift+,` slows down by `0.10×`. Supported speed is `0.50×–3.00×`. Changes apply immediately through mpv's pitch-corrected playback speed: audio that is already playing retunes mid-utterance, and the next chunk is spawned at the same rate. The slider previews each draft rate live and restores the committed rate if you cancel.
 
 ## Manual live test checklist
 
@@ -146,7 +146,7 @@ Live tests call OpenAI and incur API cost. Run them only when intended.
 7. During long playback, run `/pause`, then `/unpause`; confirm exact-position continuation.
 8. While Talking, submit a newer turn; confirm stale audio stops promptly and no old audio resumes.
 9. Pause old audio, produce a newer response, then run `/talk`; confirm the paused player is discarded before new playback.
-10. Change `/speed` during playback; confirm only the next chunk uses the new speed.
+10. Change `/speed` during playback; confirm the audio already playing changes rate without a pitch shift, and that cancelling the slider returns it to the committed rate.
 11. Run `/gag` during playback; confirm audio stops, queued chunks are discarded, and later messages remain silent.
 12. Exit or reload Pi during playback; confirm no Pi Talk `mpv` process remains.
 13. Temporarily use an invalid API key; confirm the UI shows a sanitized authentication error without provider body text.

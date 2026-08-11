@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import piTalk from "../src/index.ts";
+import { OpenAISpeechPlayback } from "../src/speech.ts";
 import {
   COARSE_SPEED_STEP,
   DEFAULT_PLAYBACK_SPEED,
@@ -125,10 +126,10 @@ test("direct shortcut and slash commands share the live speech state", async () 
     await commands.get("speed")?.handler("1.50", context);
     await invokeShortcut(SPEED_UP_SHORTCUT);
     assert.equal(lastStatus(), `${STATUS_MODEL} · ■ · 1.60×`);
-    assert.equal(lastNotification().message, "Playback speed set to 1.60× for the next utterance");
+    assert.equal(lastNotification().message, "Playback speed set to 1.60×");
     await invokeShortcut(SPEED_DOWN_SHORTCUT);
     assert.equal(lastStatus(), `${STATUS_MODEL} · ■ · 1.50×`);
-    assert.equal(lastNotification().message, "Playback speed set to 1.50× for the next utterance");
+    assert.equal(lastNotification().message, "Playback speed set to 1.50×");
 
     await commands.get("speed")?.handler("3.00", context);
     await invokeShortcut(SPEED_UP_SHORTCUT);
@@ -158,6 +159,97 @@ test("direct shortcut and slash commands share the live speech state", async () 
     assert.equal(lastStatus(), `${STATUS_MODEL} · ⏸ · 1.25×`);
     await commands.get("unpause")?.handler("", context);
     assert.equal(lastStatus(), `${STATUS_MODEL} · ▶ · 1.25×`);
+  } finally {
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousKey;
+    if (previousSpeed === undefined) delete process.env.PI_TALK_SPEED;
+    else process.env.PI_TALK_SPEED = previousSpeed;
+  }
+});
+
+test("speed changes retune the utterance that is already playing", async (t) => {
+  type Handler = (...args: any[]) => any;
+
+  const previousKey = process.env.OPENAI_API_KEY;
+  const previousSpeed = process.env.PI_TALK_SPEED;
+  process.env.OPENAI_API_KEY = "test-key";
+  delete process.env.PI_TALK_SPEED;
+
+  const pushed: number[] = [];
+  let pushFails = false;
+  t.mock.method(OpenAISpeechPlayback.prototype, "setSpeed", async (speed: number) => {
+    pushed.push(speed);
+    if (pushFails) throw new Error("player is gone");
+  });
+
+  try {
+    const events = new Map<string, Handler[]>();
+    const commands = new Map<string, { handler: Handler }>();
+    const shortcuts = new Map<string, { handler: Handler }>();
+    const notifications: Array<{ message: string; level: string }> = [];
+    const context = {
+      hasUI: true,
+      mode: "tui",
+      ui: {
+        notify(message: string, level = "info") {
+          notifications.push({ message, level });
+        },
+        setStatus() {},
+        async custom() {
+          throw new Error("custom UI is not expected in live-speed tests");
+        },
+      },
+    };
+
+    piTalk({
+      on(name: string, handler: Handler) {
+        events.set(name, [...(events.get(name) ?? []), handler]);
+      },
+      registerCommand(name: string, options: { handler: Handler }) {
+        commands.set(name, options);
+      },
+      registerShortcut(shortcut: string, options: { handler: Handler }) {
+        shortcuts.set(shortcut, options);
+      },
+    } as any);
+
+    const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+    const lastNotification = () => notifications[notifications.length - 1];
+
+    for (const handler of events.get("session_start") ?? []) await handler({}, context);
+
+    // Gagged: no player exists yet, so the push is a silent no-op.
+    await commands.get("speed")?.handler("1.50", context);
+    await settle();
+    assert.deepEqual(pushed, []);
+    assert.equal(lastNotification().message, "Playback speed set to 1.50×");
+
+    await shortcuts.get(PRIMARY_SHORTCUT)?.handler(context);
+    await settle();
+
+    await commands.get("speed")?.handler("1.75", context);
+    await settle();
+    assert.deepEqual(pushed, [1.75]);
+    assert.equal(lastNotification().message, "Playback speed set to 1.75× (applies now)");
+
+    // The speed-up shortcut routes through the same path, so it retunes too.
+    await shortcuts.get(SPEED_UP_SHORTCUT)?.handler(context);
+    await settle();
+    assert.deepEqual(pushed, [1.75, clampPlaybackSpeed(1.75 + COARSE_SPEED_STEP)]);
+
+    // A dead player must never surface as an error toast.
+    pushFails = true;
+    await commands.get("speed")?.handler("reset", context);
+    await settle();
+    assert.equal(pushed[pushed.length - 1], DEFAULT_PLAYBACK_SPEED);
+    const resetMessage = `Playback speed reset to ${DEFAULT_PLAYBACK_SPEED.toFixed(2)}× (applies now)`;
+    assert.equal(lastNotification().message, resetMessage);
+    assert.equal(lastNotification().level, "info");
+    assert.equal(
+      notifications.filter((entry) => entry.level === "error").length,
+      0,
+      "a failed speed push should not notify",
+    );
   } finally {
     if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = previousKey;
