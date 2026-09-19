@@ -679,6 +679,44 @@ test("total deadline includes waiting for player close", async () => {
   assert.deepEqual(players[0].signals, ["SIGTERM"]);
 });
 
+test("total deadline stops counting while playback is paused", async () => {
+  const players: FakePlayer[] = [];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1]));
+      controller.close();
+    },
+  });
+  const playback = playbackWith(
+    async () => new Response(body),
+    players,
+    { closeOnInputEnd: false, closeOnTerm: true },
+    { totalMs: 40 },
+  );
+
+  const pending = playback.playChunk("hello", 1);
+  let settled = false;
+  void pending.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  await waitFor(() => players.length === 1);
+  await playback.pause();
+
+  // Paused for well over the whole budget: the chunk must still be alive.
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(settled, false);
+  assert.deepEqual(players[0].signals, []);
+
+  // Once resumed, the remaining budget applies again.
+  await playback.resume();
+  await assert.rejects(
+    pending,
+    (error) => error instanceof SpeechError && error.code === "timeout",
+  );
+  assert.deepEqual(players[0].signals, ["SIGTERM"]);
+});
+
 test("failed SIGKILL cleanup blocks later playback", async () => {
   const players: FakePlayer[] = [];
   const body = new ReadableStream<Uint8Array>({

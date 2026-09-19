@@ -124,7 +124,11 @@ type ActivePlayback = {
   playerOutcome?: PlayerOutcome;
   cleanupPromise?: Promise<void>;
   totalTimer?: NodeJS.Timeout;
+  /** Unpaused time still allowed for this chunk; only counts down while armed. */
+  totalRemainingMs: number;
+  totalArmedAt?: number;
   totalDeadline?: Promise<never>;
+  expireTotal?(): void;
   interruption: Promise<never>;
   interrupt(error: Error): void;
   ioFailure?: Promise<never>;
@@ -456,6 +460,7 @@ export class OpenAISpeechPlayback {
       cancelled: false,
       interruption,
       interrupt,
+      totalRemainingMs: this.timeouts.totalMs,
       stderr: "",
     };
     this.active = active;
@@ -666,6 +671,10 @@ export class OpenAISpeechPlayback {
 
     await this.sendProperty(active, "pause", paused, "Speech player pause control failed");
     this.paused = paused;
+    // A frozen player makes no progress, so its budget must not drain either:
+    // a long pause is not a stalled chunk.
+    if (paused) this.suspendTotalDeadline(active);
+    else this.armTotalDeadline(active);
   }
 
   /**
@@ -712,14 +721,37 @@ export class OpenAISpeechPlayback {
     );
   }
 
+  /**
+   * The total budget covers only time the chunk can actually make progress.
+   * It is armed while playing and suspended while paused, so a chunk paused
+   * for longer than the budget resumes instead of failing with a timeout.
+   */
   private startTotalDeadline(active: ActivePlayback): void {
     active.totalDeadline = new Promise<never>((_resolve, reject) => {
-      active.totalTimer = setTimeout(() => {
+      active.expireTotal = () => {
+        active.totalTimer = undefined;
         active.deadline = "total";
         active.controller.abort();
         reject(new Error("speech total deadline expired"));
-      }, this.timeouts.totalMs);
+      };
     });
+    if (!this.paused) this.armTotalDeadline(active);
+  }
+
+  private armTotalDeadline(active: ActivePlayback): void {
+    if (active.totalTimer || active.deadline || !active.expireTotal) return;
+    active.totalArmedAt = Date.now();
+    active.totalTimer = setTimeout(active.expireTotal, Math.max(0, active.totalRemainingMs));
+  }
+
+  private suspendTotalDeadline(active: ActivePlayback): void {
+    if (!active.totalTimer) return;
+    clearTimeout(active.totalTimer);
+    active.totalTimer = undefined;
+    if (active.totalArmedAt !== undefined) {
+      active.totalRemainingMs -= Date.now() - active.totalArmedAt;
+      active.totalArmedAt = undefined;
+    }
   }
 
   private async withTotalDeadline<T>(active: ActivePlayback, operation: Promise<T>): Promise<T> {
