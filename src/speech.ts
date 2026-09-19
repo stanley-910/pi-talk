@@ -94,6 +94,17 @@ export class SpeechCancelledError extends Error {
   }
 }
 
+/**
+ * A fetch already in flight for `text`, handed to `playChunk` so the next
+ * chunk's audio starts generating while the current one still plays.
+ */
+export type PreparedSpeechRequest = {
+  text: string;
+  response: Promise<Response>;
+  controller: AbortController;
+  cancel(): void;
+};
+
 type Deadline = "headers" | "body" | "total";
 
 type PlayerOutcome = {
@@ -358,6 +369,44 @@ export class OpenAISpeechPlayback {
     return this.active !== undefined;
   }
 
+  /**
+   * Starts the fetch for `text` without waiting for it, so the caller can play
+   * the current chunk while this one's audio is already on the wire. The
+   * promise is never awaited here, so a cancelled, never-consumed prepare must
+   * not surface as an unhandled rejection.
+   */
+  prepare(text: string): PreparedSpeechRequest {
+    const controller = new AbortController();
+    const response = this.fetchSpeech(text, controller.signal);
+    void response.catch(() => undefined);
+    return {
+      text,
+      response,
+      controller,
+      cancel: () => controller.abort(),
+    };
+  }
+
+  private fetchSpeech(text: string, signal: AbortSignal): Promise<Response> {
+    return this.fetcher(OPENAI_SPEECH_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "audio/wav, application/octet-stream",
+      },
+      body: JSON.stringify({
+        model: OPENAI_SPEECH_MODEL,
+        voice: OPENAI_SPEECH_VOICE,
+        input: text,
+        response_format: "wav",
+        stream_format: "audio",
+        speed: 1,
+      }),
+      signal,
+    });
+  }
+
   pause(): Promise<void> {
     return this.setPaused(true);
   }
@@ -388,10 +437,13 @@ export class OpenAISpeechPlayback {
     return cancellation;
   }
 
-  async playChunk(text: string, playbackSpeed: number): Promise<void> {
+  async playChunk(text: string, playbackSpeed: number, prepared?: PreparedSpeechRequest): Promise<void> {
     if (this.cleanupFailure) throw this.cleanupFailure;
     await this.cancellation;
     if (this.active) throw new Error("Speech playback is already active");
+
+    // A prepared request only applies to the chunk it was started for.
+    const adopted = prepared && prepared.text === text ? prepared : undefined;
 
     let interrupt = (_error: Error) => undefined;
     const interruption = new Promise<never>((_resolve, reject) => {
@@ -400,7 +452,7 @@ export class OpenAISpeechPlayback {
     void interruption.catch(() => undefined);
 
     const active: ActivePlayback = {
-      controller: new AbortController(),
+      controller: adopted?.controller ?? new AbortController(),
       cancelled: false,
       interruption,
       interrupt,
@@ -410,28 +462,30 @@ export class OpenAISpeechPlayback {
     this.startTotalDeadline(active);
 
     try {
-      const response = await this.withStageDeadline(
-        active,
-        this.fetcher(OPENAI_SPEECH_URL, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${this.apiKey}`,
-            "Content-Type": "application/json",
-            Accept: "audio/wav, application/octet-stream",
-          },
-          body: JSON.stringify({
-            model: OPENAI_SPEECH_MODEL,
-            voice: OPENAI_SPEECH_VOICE,
-            input: text,
-            response_format: "wav",
-            stream_format: "audio",
-            speed: 1,
-          }),
-          signal: active.controller.signal,
-        }),
-        this.timeouts.headerMs,
-        "headers",
-      );
+      let response: Response;
+      if (adopted) {
+        try {
+          response = await this.withStageDeadline(active, adopted.response, this.timeouts.headerMs, "headers");
+        } catch (error) {
+          this.assertCurrent(active);
+          // A stage/total deadline expiry is a real timeout, not the "server
+          // dropped an unread response" case the fallback exists for.
+          if (active.deadline) throw error;
+          response = await this.withStageDeadline(
+            active,
+            this.fetchSpeech(text, active.controller.signal),
+            this.timeouts.headerMs,
+            "headers",
+          );
+        }
+      } else {
+        response = await this.withStageDeadline(
+          active,
+          this.fetchSpeech(text, active.controller.signal),
+          this.timeouts.headerMs,
+          "headers",
+        );
+      }
 
       this.assertCurrent(active);
       active.responseBody = response.body ?? undefined;
@@ -497,14 +551,41 @@ export class OpenAISpeechPlayback {
         active.stderr = (active.stderr + String(chunk)).slice(0, 2_048);
       });
       active.reader = response.body.getReader();
+      // A prepared response is retried once more if its very first read fails
+      // (the "adopted response, unread too long" case); once any read has been
+      // attempted, a failure is treated like any other body-stage error.
+      let bodyRetryAvailable = adopted !== undefined;
       while (true) {
         this.assertCurrent(active);
-        const result = await this.withStageDeadline(
-          active,
-          active.reader.read(),
-          this.timeouts.bodyIdleMs,
-          "body",
-        );
+        const retryEligible = bodyRetryAvailable;
+        bodyRetryAvailable = false;
+
+        let result: ReadableStreamReadResult<Uint8Array>;
+        try {
+          result = await this.withStageDeadline(active, active.reader.read(), this.timeouts.bodyIdleMs, "body");
+        } catch (error) {
+          this.assertCurrent(active);
+          if (!retryEligible || active.deadline) throw error;
+
+          const retryResponse = await this.withStageDeadline(
+            active,
+            this.fetchSpeech(text, active.controller.signal),
+            this.timeouts.headerMs,
+            "headers",
+          );
+          this.assertCurrent(active);
+          if (!retryResponse.ok) throw responseError(retryResponse);
+          if (!retryResponse.body) {
+            throw new SpeechError(
+              "provider",
+              "Speech temporarily unavailable.",
+              "OpenAI speech returned no audio body",
+            );
+          }
+          active.responseBody = retryResponse.body;
+          active.reader = retryResponse.body.getReader();
+          continue;
+        }
         if (result.done) break;
         if (!result.value || result.value.byteLength === 0) continue;
 

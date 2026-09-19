@@ -3,7 +3,7 @@ import test from "node:test";
 import { EventEmitter } from "node:events";
 import { PassThrough, Readable } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { SpeechCancelledError, SpeechError } from "../src/speech.ts";
+import { SpeechCancelledError, SpeechError, type PreparedSpeechRequest } from "../src/speech.ts";
 import {
   KILL_GRACE_MS,
   PAUSE_SIGNAL,
@@ -144,12 +144,33 @@ class FakePlayback implements SpeakerPlayback {
   readonly pausedCalls: boolean[] = [];
   /** Every live retune the daemon pushed at audio already playing, in order. */
   readonly liveSpeeds: number[] = [];
+  /** Text handed to prepare(), in call order. */
+  readonly preparedTexts: string[] = [];
+  /** Text of every prepared request cancel() was called on. */
+  readonly preparedCancelled: string[] = [];
+  /** Prepared request (if any) each playChunk call was handed, in order. */
+  readonly playChunkPrepared: (string | undefined)[] = [];
   cancelCount = 0;
   private pending?: (error: unknown) => void;
   private readonly hold: boolean;
+  readonly prepare?: (text: string) => PreparedSpeechRequest;
 
-  constructor(hold = false) {
+  constructor(hold = false, supportsPrepare = false) {
     this.hold = hold;
+    if (supportsPrepare) {
+      this.prepare = (text: string): PreparedSpeechRequest => {
+        this.preparedTexts.push(text);
+        return {
+          text,
+          // Never settles in these tests: only prepare()/cancel() bookkeeping matters here.
+          response: new Promise<Response>(() => undefined),
+          controller: new AbortController(),
+          cancel: () => {
+            this.preparedCancelled.push(text);
+          },
+        };
+      };
+    }
   }
 
   get paused(): boolean {
@@ -171,9 +192,10 @@ class FakePlayback implements SpeakerPlayback {
     return Promise.resolve();
   }
 
-  playChunk(text: string, playbackSpeed: number): Promise<void> {
+  playChunk(text: string, playbackSpeed: number, prepared?: PreparedSpeechRequest): Promise<void> {
     this.spoken.push(text);
     this.speeds.push(playbackSpeed);
+    this.playChunkPrepared.push(prepared?.text);
     if (!this.hold) return Promise.resolve();
     return new Promise<void>((_resolve, reject) => {
       this.pending = reject;
@@ -802,6 +824,25 @@ test("speakText strips math, orders chunks, and stops once cancelled", async () 
     () => cancelled,
   );
   assert.equal(stopping.spoken.length, 1);
+});
+
+test("speakText with 2+ chunks issues the fetch for chunk 2 while chunk 1 is still playing", async () => {
+  const playback = new FakePlayback(true, true);
+  // Long enough that splitSpeechText produces several chunks to span.
+  const long = Array.from({ length: 400 }, (_, index) => `Sentence ${index} carries on.`).join(" ");
+
+  const pending = speakText(long, playback, () => 1.25);
+
+  await waitFor(() => playback.spoken.length === 1);
+  // Chunk 1 is still awaiting playChunk (hold never resolves it) while chunk 2's fetch starts.
+  await waitFor(() => playback.preparedTexts.length === 2);
+  assert.equal(playback.preparedTexts[0], playback.spoken[0]);
+  assert.equal(playback.playChunkPrepared[0], playback.preparedTexts[0]);
+
+  await playback.cancel();
+  await assert.rejects(pending, SpeechCancelledError);
+  // The outstanding chunk-2 prepare must not be left running unread.
+  assert.deepEqual(playback.preparedCancelled, [playback.preparedTexts[1]]);
 });
 
 test("the speaker path never speaks fenced code, URLs, or markdown syntax", async () => {

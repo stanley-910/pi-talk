@@ -13,6 +13,7 @@ import {
   SpeechCancelledError,
   SpeechError,
   splitSpeechText,
+  type PreparedSpeechRequest,
 } from "./speech.ts";
 
 /** Substring every speaker command line carries, used to reject reused pids. */
@@ -95,13 +96,15 @@ export type SpeakerFileSystem = {
 };
 
 export type SpeakerPlayback = {
-  playChunk(text: string, playbackSpeed: number): Promise<void>;
+  playChunk(text: string, playbackSpeed: number, prepared?: PreparedSpeechRequest): Promise<void>;
   cancel(): Promise<void>;
   /** Exact-position freeze; absent on players that cannot pause. */
   pause?(): Promise<void>;
   resume?(): Promise<void>;
   /** Retunes audio already playing; absent on players that only set speed at spawn. */
   setSpeed?(speed: number): Promise<void>;
+  /** Absent on players that cannot pipeline the next chunk's fetch. */
+  prepare?(text: string): PreparedSpeechRequest;
 };
 
 /** Stops a directory watch. Calling it twice is safe. */
@@ -569,6 +572,11 @@ export function logSpeakerFailure(environment: SpeakerEnvironment, stateDir: str
 /**
  * `resolveSpeed` is asked once per chunk rather than once per utterance, which
  * is what lets `talk speed` reach a daemon that is already talking.
+ *
+ * Pipelines the network fetch for chunk N+1 against chunk N's playback, so the
+ * multi-second gap at a chunk boundary is hidden behind the audio already
+ * playing. `resolveSpeed` stays a per-chunk, play-time read: preparing a
+ * chunk only starts its fetch, it never touches the speed knob.
  */
 export async function speakText(
   text: string,
@@ -578,9 +586,23 @@ export async function speakText(
 ): Promise<void> {
   // cleanMarkdownForSpeech already applies stripDelimitedMath; do not repeat it.
   const chunks = splitSpeechText(cleanMarkdownForSpeech(text));
-  for (const chunk of chunks) {
-    if (isCancelled()) return;
-    await playback.playChunk(chunk, resolveSpeed());
+  let prepared: PreparedSpeechRequest | undefined = chunks.length > 0 ? playback.prepare?.(chunks[0]) : undefined;
+
+  try {
+    for (let index = 0; index < chunks.length; index += 1) {
+      if (isCancelled()) return;
+      const next = chunks[index + 1];
+      const nextPrepared = next !== undefined ? playback.prepare?.(next) : undefined;
+      try {
+        await playback.playChunk(chunks[index], resolveSpeed(), prepared);
+      } finally {
+        prepared = nextPrepared;
+      }
+    }
+  } finally {
+    // Cancellation or an error mid-utterance must not leave a chunk's fetch
+    // running unread.
+    prepared?.cancel();
   }
 }
 

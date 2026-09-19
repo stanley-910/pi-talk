@@ -733,6 +733,171 @@ test("provider errors are sanitized and never retried", async () => {
   assert.equal(players.length, 0);
 });
 
+test("prepare issues the fetch immediately, before playChunk is called", async () => {
+  const players: FakePlayer[] = [];
+  let fetchCalled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1]));
+      controller.close();
+    },
+  });
+  const playback = playbackWith(async () => {
+    fetchCalled = true;
+    return new Response(body);
+  }, players);
+
+  const prepared = playback.prepare("hello");
+
+  assert.equal(fetchCalled, true);
+  await playback.playChunk("hello", 1, prepared);
+});
+
+test("playChunk with a matching prepared request does not issue a second fetch", async () => {
+  const players: FakePlayer[] = [];
+  let calls = 0;
+  let capturedSignal: AbortSignal | undefined;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1]));
+      controller.close();
+    },
+  });
+  const playback = playbackWith((_url, init) => {
+    calls += 1;
+    capturedSignal = init?.signal ?? undefined;
+    return Promise.resolve(new Response(body));
+  }, players);
+
+  const prepared = playback.prepare("hello");
+  assert.equal(calls, 1);
+
+  await playback.playChunk("hello", 1, prepared);
+
+  assert.equal(calls, 1);
+  assert.equal(capturedSignal, prepared.controller.signal);
+});
+
+test("a prepared request for different text is ignored and a fresh fetch is issued", async () => {
+  const players: FakePlayer[] = [];
+  const seen: string[] = [];
+  const body = () =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(Uint8Array.from([1]));
+        controller.close();
+      },
+    });
+  const playback = playbackWith((_url, init) => {
+    seen.push(JSON.parse(String(init?.body)).input);
+    return Promise.resolve(new Response(body()));
+  }, players);
+
+  const prepared = playback.prepare("goodbye");
+  await playback.playChunk("hello", 1, prepared);
+
+  assert.deepEqual(seen, ["goodbye", "hello"]);
+});
+
+test("cancel during playback aborts the outstanding prepared request's signal", async () => {
+  const players: FakePlayer[] = [];
+  let aborted = false;
+  const playback = playbackWith(
+    (_url, init) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          aborted = true;
+          reject(new DOMException("aborted", "AbortError"));
+        });
+      }),
+    players,
+  );
+
+  const prepared = playback.prepare("hello");
+  const pending = playback.playChunk("hello", 1, prepared);
+  await waitFor(() => playback.hasActivePlayback);
+  await playback.cancel();
+
+  await assert.rejects(pending, SpeechCancelledError);
+  assert.equal(aborted, true);
+  assert.equal(prepared.controller.signal.aborted, true);
+});
+
+test("a prepared request that fails pre-body triggers exactly one fresh refetch and the chunk still plays", async () => {
+  const players: FakePlayer[] = [];
+  let calls = 0;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1, 2]));
+      controller.close();
+    },
+  });
+  const playback = playbackWith((_url, init) => {
+    calls += 1;
+    if (calls === 1) {
+      // The prepared fetch fails before any body byte was consumed, as if the
+      // server dropped an unread response after a long previous chunk.
+      return Promise.reject(new Error("socket hang up"));
+    }
+    return Promise.resolve(new Response(body));
+  }, players);
+
+  const prepared = playback.prepare("hello");
+  await playback.playChunk("hello", 1, prepared);
+
+  assert.equal(calls, 2);
+  assert.deepEqual(Buffer.concat(players[0].audio), Buffer.from([1, 2]));
+});
+
+test("an adopted response whose body errors on first read triggers one refetch and the chunk still plays", async () => {
+  const players: FakePlayer[] = [];
+  let calls = 0;
+  const failingBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.error(new Error("stream reset"));
+    },
+  });
+  const goodBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1, 2]));
+      controller.close();
+    },
+  });
+  const playback = playbackWith((_url) => {
+    calls += 1;
+    return Promise.resolve(new Response(calls === 1 ? failingBody : goodBody));
+  }, players);
+
+  const prepared = playback.prepare("hello");
+  await playback.playChunk("hello", 1, prepared);
+
+  assert.equal(calls, 2);
+  // The already-spawned player is reused, not respawned, across the retry.
+  assert.equal(players.length, 1);
+  assert.deepEqual(Buffer.concat(players[0].audio), Buffer.from([1, 2]));
+});
+
+test("a body failure after bytes were consumed does not refetch", async () => {
+  const players: FakePlayer[] = [];
+  let calls = 0;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(Uint8Array.from([1, 2]));
+      // Errors on the second read, after the first already delivered bytes.
+      setTimeout(() => controller.error(new Error("stream reset")), 2);
+    },
+  });
+  const playback = playbackWith((_url) => {
+    calls += 1;
+    return Promise.resolve(new Response(body));
+  }, players);
+
+  const prepared = playback.prepare("hello");
+  await assert.rejects(playback.playChunk("hello", 1, prepared), SpeechError);
+
+  assert.equal(calls, 1);
+});
+
 test("a second play cannot overlap an active request", async () => {
   const players: FakePlayer[] = [];
   const playback = playbackWith(
