@@ -131,6 +131,7 @@ function playbackWith(
     bodyIdleMs: number;
     controlMs: number;
     totalMs: number;
+    playbackSlackMs: number;
     termGraceMs: number;
     killGraceMs: number;
   }> = {},
@@ -147,6 +148,7 @@ function playbackWith(
       headerMs: 100,
       bodyIdleMs: 100,
       totalMs: 500,
+      playbackSlackMs: 5,
       termGraceMs: 5,
       killGraceMs: 20,
       ...timeoutOverrides,
@@ -209,7 +211,7 @@ test("playChunk sends the pinned request and streams WAV bytes to mpv", async ()
       players.push(player);
       return player;
     },
-    timeouts: { headerMs: 100, bodyIdleMs: 100, totalMs: 500, termGraceMs: 5, killGraceMs: 20 },
+    timeouts: { headerMs: 100, bodyIdleMs: 100, totalMs: 500, playbackSlackMs: 5, termGraceMs: 5, killGraceMs: 20 },
   });
 
   await playback.playChunk("hello", 1.25);
@@ -232,6 +234,7 @@ test("playChunk sends the pinned request and streams WAV bytes to mpv", async ()
     "--no-terminal",
     "--msg-level=all=error",
     "--input-ipc-client=fd://3",
+    "--audio-channels=stereo",
     "--audio-pitch-correction=yes",
     "--speed=1.25",
     "--demuxer-lavf-format=wav",
@@ -677,6 +680,37 @@ test("total deadline includes waiting for player close", async () => {
     (error) => error instanceof SpeechError && error.code === "timeout",
   );
   assert.deepEqual(players[0].signals, ["SIGTERM"]);
+});
+
+test("the playback wait is sized from the audio received, not the streaming budget", async () => {
+  const players: FakePlayer[] = [];
+  // 24 kB of WAV is one second at the slowest speed, far beyond a 5 ms budget.
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(24_000));
+      controller.close();
+    },
+  });
+  const playback = playbackWith(
+    async () => new Response(body),
+    players,
+    { closeOnInputEnd: false, closeOnTerm: true },
+    { totalMs: 5 },
+  );
+
+  const pending = playback.playChunk("hello", 1);
+  let settled = false;
+  void pending.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  await waitFor(() => players.length === 1 && players[0].audio.length > 0);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(settled, false, "the player must be allowed the audio's own length");
+  assert.deepEqual(players[0].signals, []);
+
+  players[0].close(0, null);
+  await pending;
 });
 
 test("total deadline stops counting while playback is paused", async () => {

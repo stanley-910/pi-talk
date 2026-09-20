@@ -12,6 +12,7 @@ import {
   type SpeechMode,
 } from "./controls.ts";
 import { cleanForSpeech, stripFencedCode } from "./clean.ts";
+import { TalkFloor } from "./floor.ts";
 import {
   OPENAI_SPEECH_MODEL,
   OPENAI_SPEECH_VOICE,
@@ -31,6 +32,8 @@ type SpeechState = {
   mode: SpeechMode;
   playbackSpeed: number;
   processing: boolean;
+  /** Blocked behind another Pi instance that holds the floor. */
+  waiting: boolean;
   queue: string[];
   generation: number;
   activeContext?: ExtensionContext;
@@ -64,6 +67,7 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     mode: "gagged",
     playbackSpeed: configuredPlaybackSpeed(),
     processing: false,
+    waiting: false,
     queue: [],
     generation: 0,
     disclosureShown: false,
@@ -75,6 +79,9 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     currentMessageComplete: false,
     seenQuestionCalls: new Set(),
   };
+
+  // One Pi instance speaks at a time, machine-wide; see src/floor.ts.
+  const floor = new TalkFloor();
 
   function notify(ctx: ExtensionContext | undefined, message: string, level: UiLevel = "info") {
     if (ctx?.hasUI) ctx.ui.notify(message, level);
@@ -109,7 +116,8 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     const ctx = state.activeContext;
     if (!ctx?.hasUI) return;
 
-    const indicator = state.mode === "talking" ? "▶" : state.mode === "paused" ? "⏸" : "■";
+    const indicator =
+      state.mode === "talking" ? (state.waiting ? "⏳" : "▶") : state.mode === "paused" ? "⏸" : "■";
     ctx.ui.setStatus(
       STATUS_ID,
       `${indicator} · ${formatPlaybackSpeed(state.playbackSpeed)}`,
@@ -235,6 +243,8 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
     state.generation += 1;
     if (clearQueue) state.queue = [];
     state.processing = false;
+    state.waiting = false;
+    floor.release();
     updateStatus();
     await state.playback?.cancel();
   }
@@ -275,6 +285,19 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
 
     const generation = state.generation;
     try {
+      if (state.queue.length > 0 && !floor.held) {
+        const granted = await floor.acquire({
+          shouldAbort: () => generation !== state.generation || state.mode !== "talking",
+          onWait: () => {
+            state.waiting = true;
+            updateStatus();
+            notify(state.activeContext, "Waiting for another Pi Talk to finish");
+          },
+        });
+        state.waiting = false;
+        if (!granted) return;
+      }
+
       while (state.mode === "talking" && state.queue.length > 0 && generation === state.generation) {
         const text = state.queue.shift();
         if (!text) continue;
@@ -291,6 +314,9 @@ export default function piSpeakPrototype(pi: ExtensionAPI) {
         }
       }
     } finally {
+      // A paused instance keeps the floor so its exact position is not talked
+      // over; every other exit hands it to whoever is waiting.
+      if (generation !== state.generation || state.mode !== "paused") floor.release();
       if (generation === state.generation) state.processing = false;
       updateStatus();
     }

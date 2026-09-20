@@ -10,11 +10,18 @@ export const OPENAI_SPEECH_MODEL = "gpt-4o-mini-tts-2025-12-15";
 export const OPENAI_SPEECH_VOICE = "marin";
 export const MAX_SPEECH_CHUNK_BYTES = 1_800;
 
+/**
+ * OpenAI's WAV is 24 kHz, 16-bit mono: 48,000 bytes per second at 1.0×. The
+ * slowest supported speed, 0.5×, doubles that to 24,000 bytes per second.
+ */
+const SLOWEST_WAV_BYTES_PER_MS = 24;
+
 const DEFAULT_TIMEOUTS: SpeechTimeouts = {
   headerMs: 15_000,
   bodyIdleMs: 10_000,
   controlMs: 1_000,
   totalMs: 120_000,
+  playbackSlackMs: 30_000,
   termGraceMs: 250,
   killGraceMs: 1_000,
 };
@@ -43,6 +50,8 @@ type SpeechTimeouts = {
   bodyIdleMs: number;
   controlMs: number;
   totalMs: number;
+  /** Headroom past the audio's own length before a stalled player counts as hung. */
+  playbackSlackMs: number;
   termGraceMs: number;
   killGraceMs: number;
 };
@@ -127,6 +136,8 @@ type ActivePlayback = {
   /** Unpaused time still allowed for this chunk; only counts down while armed. */
   totalRemainingMs: number;
   totalArmedAt?: number;
+  /** WAV bytes handed to the player, which bounds how long playback can take. */
+  audioBytes: number;
   totalDeadline?: Promise<never>;
   expireTotal?(): void;
   interruption: Promise<never>;
@@ -461,6 +472,7 @@ export class OpenAISpeechPlayback {
       interruption,
       interrupt,
       totalRemainingMs: this.timeouts.totalMs,
+      audioBytes: 0,
       stderr: "",
     };
     this.active = active;
@@ -511,6 +523,11 @@ export class OpenAISpeechPlayback {
           "--no-terminal",
           "--msg-level=all=error",
           "--input-ipc-client=fd://3",
+          // OpenAI's WAV is mono, which macOS's coreaudio driver refuses. mpv
+          // then falls back to AVFoundation, whose two-second device buffer
+          // is discarded at exit and silently drops the end of every chunk.
+          // Upmixing to stereo keeps coreaudio, which plays to the last sample.
+          "--audio-channels=stereo",
           "--audio-pitch-correction=yes",
           `--speed=${playbackSpeed}`,
           "--demuxer-lavf-format=wav",
@@ -596,6 +613,7 @@ export class OpenAISpeechPlayback {
 
         this.assertCurrent(active);
         if (active.playerOutcome) throw this.playerFailure(active.playerOutcome);
+        active.audioBytes += result.value.byteLength;
         if (!player.stdin.write(result.value)) {
           await this.withTotalDeadline(
             active,
@@ -611,6 +629,10 @@ export class OpenAISpeechPlayback {
 
       this.assertCurrent(active);
       player.stdin.end();
+      // The network is done; what remains is playing the audio out, which a
+      // long chunk at a slow speed legitimately needs longer than the
+      // streaming budget for. Give it the audio's own length plus slack.
+      this.extendTotalDeadline(active, active.audioBytes / SLOWEST_WAV_BYTES_PER_MS + this.timeouts.playbackSlackMs);
       const outcome = await this.withTotalDeadline(active, active.playerClosed);
       this.assertCurrent(active);
       if (outcome.code !== 0) throw this.playerFailure(outcome);
@@ -742,6 +764,14 @@ export class OpenAISpeechPlayback {
     if (active.totalTimer || active.deadline || !active.expireTotal) return;
     active.totalArmedAt = Date.now();
     active.totalTimer = setTimeout(active.expireTotal, Math.max(0, active.totalRemainingMs));
+  }
+
+  /** Raises the remaining budget to at least `minimumMs`, never lowering it. */
+  private extendTotalDeadline(active: ActivePlayback, minimumMs: number): void {
+    const armed = active.totalTimer !== undefined;
+    this.suspendTotalDeadline(active);
+    active.totalRemainingMs = Math.max(active.totalRemainingMs, Math.ceil(minimumMs));
+    if (armed) this.armTotalDeadline(active);
   }
 
   private suspendTotalDeadline(active: ActivePlayback): void {
